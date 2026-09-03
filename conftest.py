@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import polars as pl
 import pytest
 from aces.config import (
     DerivedPredicateConfig,
@@ -31,6 +32,25 @@ def _hospital_predicates() -> dict[str, PlainPredicateConfig | DerivedPredicateC
 
 
 @pytest.fixture
+def sample_MEDS_df() -> pl.DataFrame:
+    """A tiny MEDS dataset matching ``sample_ACES_cfg``: one survivor, one death."""
+    return pl.DataFrame(
+        {
+            "subject_id": [1, 1, 1, 2, 2],
+            "time": [
+                datetime(2020, 1, 1),
+                datetime(2020, 1, 1, 12),
+                datetime(2020, 1, 5),
+                datetime(2020, 1, 1),
+                datetime(2020, 1, 4),
+            ],
+            "code": ["ICU_ADMISSION", "LAB//A", "ICU_DISCHARGE", "ICU_ADMISSION", "MEDS_DEATH"],
+            "numeric_value": [None, 1.0, None, None, None],
+        }
+    )
+
+
+@pytest.fixture
 def sample_ACES_cfg() -> TaskExtractorConfig:
     """A simple in-ICU mortality configuration: 24h input, 24h gap, label at next discharge or death."""
     return TaskExtractorConfig(
@@ -45,7 +65,7 @@ def sample_ACES_cfg() -> TaskExtractorConfig:
             "input": WindowConfig(
                 "trigger",
                 "start + 24h",
-                True,
+                False,
                 True,
                 index_timestamp="end",
                 has={"icu_admission": "(None, 0)", "discharge_or_death": "(None, 0)"},
@@ -196,6 +216,7 @@ def two_stage_cfg() -> TaskExtractorConfig:
 def _setup_doctest_namespace(
     doctest_namespace: dict[str, Any],
     sample_ACES_cfg: TaskExtractorConfig,
+    sample_MEDS_df: pl.DataFrame,
     in_hosp_mortality_cfg: TaskExtractorConfig,
     post_discharge_mortality_cfg: TaskExtractorConfig,
     readmission_cfg: TaskExtractorConfig,
@@ -209,6 +230,8 @@ def _setup_doctest_namespace(
             "Path": Path,
             "print_ACES": print_ACES,
             "sample_ACES_cfg": sample_ACES_cfg,
+            "sample_MEDS_df": sample_MEDS_df,
+            "pl": pl,
             "in_hosp_mortality_cfg": in_hosp_mortality_cfg,
             "post_discharge_mortality_cfg": post_discharge_mortality_cfg,
             "readmission_cfg": readmission_cfg,
