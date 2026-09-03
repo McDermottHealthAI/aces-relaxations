@@ -1,0 +1,12 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: copier-migration
+_src_path: gh:McDermottHealthAI/MHAL-template
+author_email: mattmcdermott8@gmail.com
+author_name: Matthew McDermott
+github_org: McDermottHealthAI
+github_repo: aces-relaxations
+license: MIT
+package_description: Relaxations and structural properties for ACES task configurations, to map future-only task definitions onto reduced query languages.
+package_name: aces_relaxations
+pypi_name: aces-relaxations
+python_version: "3.12"
