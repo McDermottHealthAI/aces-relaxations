@@ -18,8 +18,8 @@ them without changing the label of any prediction-time row:
    whose criteria (if any) sit only on its last window.
 
 The result is a genuine ACES configuration whose trigger is a synthetic *index event* predicate marking the
-prediction time, so it can be run through ACES itself (see ``aces_relaxations.extraction``), and whose branches
-are exposed for downstream converters.
+prediction time, so it can be run through ACES itself (see ``aces_relaxations.extraction``), and whose
+branches are exposed for downstream converters.
 
 Why this is label-preserving: with every edge in the prediction-time subtree moving forward in time, the
 timestamp of every window endpoint is a deterministic function of the data and the prediction time, computed
@@ -225,7 +225,7 @@ def _render_timedelta(delta: timedelta) -> str:
         >>> _render_timedelta(timedelta(hours=1))
         '1 hour'
     """
-    seconds = int(round(delta.total_seconds()))
+    seconds = round(delta.total_seconds())
     for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
         if seconds % size == 0:
             n = seconds // size
@@ -502,7 +502,9 @@ def normalize(
         ...     trigger=EventConfig("A"),
         ...     windows={
         ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
-        ...         "lookback": WindowConfig("end - 3d", "input.end + 2d", False, True, has={"A": "(None, 0)"}),
+        ...         "lookback": WindowConfig(
+        ...             "end - 3d", "input.end + 2d", False, True, has={"A": "(None, 0)"}
+        ...         ),
         ...         "target": WindowConfig("input.end", "start + 5d", False, True, label="B"),
         ...     },
         ... )
