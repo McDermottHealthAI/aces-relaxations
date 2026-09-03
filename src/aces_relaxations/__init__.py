@@ -7,7 +7,7 @@ can be expressed in reduced query languages (generative trajectory labeling, "ev
 queries, and so on).
 
 Key entry points:
-  - [`relax`][aces_relaxations.relaxations.relax] -- validate, prune, and apply relaxations by name.
+  - [`relax`][aces_relaxations.registry.relax] -- validate, prune, and apply relaxations by name.
   - [`is_future_only`][aces_relaxations.future_only.is_future_only] /
     [`validate_future_only`][aces_relaxations.future_only.validate_future_only] -- the structural property.
   - [`print_ACES`][aces_relaxations.printing.print_ACES] -- a tree pretty-printer for configurations.
@@ -21,23 +21,28 @@ from .constraint_simplification import (
 )
 from .extraction import extract, extract_at, get_predicates, with_index_events
 from .future_only import future_only_violations, is_future_only, validate_future_only
+from .independence import assume_independent_codes
+from .predicates import PredicateExpr, label_predicate_expr, leaf_predicates, predicate_expr
 from .printing import get_constraint_str, print_ACES
+from .registry import RELAXATIONS, relax
 from .relaxations import (
-    RELAXATIONS,
     collapse_temporal_gap_windows,
-    relax,
     remove_all_criteria,
     remove_post_label_windows,
     strip_to_relevant_windows,
 )
 from .tree import RelaxedTaskConfig, WindowNode, label_node, prediction_time_node, resolve_node
+from .vocabulary import MARGINAL_CODE, matching_codes, restrict_to_vocabulary, vocabulary_matches
 
 __all__ = [
+    "MARGINAL_CODE",
     "RELAXATIONS",
     "ConstraintSimplificationRules",
     "ConstraintTarget",
+    "PredicateExpr",
     "RelaxedTaskConfig",
     "WindowNode",
+    "assume_independent_codes",
     "classify_constraint",
     "collapse_temporal_gap_windows",
     "extract",
@@ -47,13 +52,19 @@ __all__ = [
     "get_predicates",
     "is_future_only",
     "label_node",
+    "label_predicate_expr",
+    "leaf_predicates",
+    "matching_codes",
+    "predicate_expr",
     "prediction_time_node",
     "print_ACES",
     "relax",
     "remove_all_criteria",
     "remove_post_label_windows",
     "resolve_node",
+    "restrict_to_vocabulary",
     "simplify_constraints",
     "strip_to_relevant_windows",
     "validate_future_only",
+    "vocabulary_matches",
 ]
