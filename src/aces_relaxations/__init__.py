@@ -21,7 +21,13 @@ from .constraint_simplification import (
     classify_constraint,
     simplify_constraints,
 )
-from .extraction import extract, extract_at, get_predicates, with_index_events
+from .extraction import (
+    extract,
+    extract_at,
+    extract_label_window_bounds,
+    get_predicates,
+    with_index_events,
+)
 from .future_only import future_only_violations, is_future_only, validate_future_only
 from .independence import assume_independent_codes
 from .normalization import Branch, Edge, NormalizedTaskConfig, branches, normalize
@@ -54,6 +60,7 @@ __all__ = [
     "collapse_temporal_gap_windows",
     "extract",
     "extract_at",
+    "extract_label_window_bounds",
     "future_only_violations",
     "get_constraint_str",
     "get_predicates",

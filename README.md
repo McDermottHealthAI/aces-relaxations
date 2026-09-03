@@ -189,10 +189,17 @@ and the conjunction of criteria across branches equals the original conjunction.
 unconstrained temporal windows `(a, b]` and `(b, c]` into `(a, c]` changes no endpoint anything refers to,
 and the merged window is itself unconstrained.
 
+Windows defined backward from a later endpoint (`start: end - 1d`, `end: week.end`) are kept whenever they
+are *guaranteeably* still in the future: the guaranteed elapsed time along the path (the sum of the temporal
+windows on it; event-bounded windows guarantee nothing, since the event may occur immediately) must cover
+the look-back. Such a window is rewritten as a forward chain from the rewound position, and its descendants
+continue from there. A look-back that could reach before the prediction time, or that crosses an
+event-bounded window, is an error.
+
 Two things are *not* preserved, by design. Cohort selection before the prediction time is gone, so the
-normalized configuration can only be compared on rows the original produces. And a criterion whose window
-starts before the prediction time but extends past it (a look-back window with a forward end) is discarded
-with the rest of the pre-prediction-time structure, even though it touches future data.
+normalized configuration can only be compared on rows the original produces. And a branch that *starts* by
+moving backward from the prediction time (a look-back window anchored at the prediction time itself) is
+discarded with the rest of the pre-prediction-time structure, with a warning.
 
 This is checked against ACES itself: `tests/test_normalize_property.py` generates random future-only
 configurations and random MEDS data with [hypothesis](https://hypothesis.readthedocs.io/), extracts labels
@@ -218,7 +225,22 @@ True
 ```
 
 Anchoring is done in the predicate table rather than by adding events to the data, so that an anchor at a
-time with no real event does not count towards `_ANY_EVENT` criteria.
+time with no real event does not count towards `_ANY_EVENT` criteria. A second property test draws
+*arbitrary* ACES configurations (any reference, direction, bound type, record boundary, or index / label
+placement) and requires `normalize` to either raise or match ACES exactly.
+
+The future-only property itself is checked empirically too (`tests/test_future_only_property.py`): on
+fixed random populations, a configuration judged guaranteeably future-only never realizes a label window
+starting before its prediction time, and a criteria-free configuration whose label is reachable only
+through a path that can look back realizes one at least once. The data are deliberately moderately sparse
+so that "can look back" is a real possibility rather than a theoretical one.
+
+> [!NOTE]
+> The extraction helpers take the prediction time from the resolved window tree rather than from ACES's
+> `index_timestamp` column. ACES names the two timestamps in a node's summary by traversal direction rather
+> than by time, so for a window defined backward from its end (`start: end - 1d`, `end: trigger`) with
+> `index_timestamp: end`, its column reports the window's *start*. ACES also accumulates into each bound's
+> `offset` on every query, so configurations are deep-copied before querying.
 
 ## Supported Config Relaxations
 

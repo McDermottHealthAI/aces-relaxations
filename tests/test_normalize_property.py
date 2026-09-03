@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timedelta
 
 import polars as pl
+import pytest
 from aces.config import (
     DerivedPredicateConfig,
     EventConfig,
@@ -18,7 +19,7 @@ from aces.config import (
     TaskExtractorConfig,
     WindowConfig,
 )
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, assume, event, given, settings
 from hypothesis import strategies as st
 
 from aces_relaxations.extraction import extract, extract_at
@@ -45,21 +46,34 @@ def task_configs(draw: st.DrawFn) -> TaskExtractorConfig:
     )
 
     n_future = draw(st.integers(1, 4))
-    ends = ["input.end"]
+    # For every referenceable endpoint, the days of temporal windows since the prediction time or the last
+    # event-bounded endpoint: how far a window may look back from it and still be a start-rooted chain.
+    slack: dict[str, int] = {"input.end": 0}
     for i in range(n_future):
         name = f"w{i}"
-        parent = draw(st.sampled_from(ends))
-        start = f"{parent} + {draw(st.integers(1, 2))}d" if draw(st.integers(0, 4)) == 0 else parent
+        parent = draw(st.sampled_from(sorted(slack)))
+        has = {p: draw(st.sampled_from(CONSTRAINTS)) for p in PREDICATES if draw(st.integers(0, 3)) == 0}
+        start_inclusive, end_inclusive = draw(st.booleans()), draw(st.booleans())
+
+        if slack[parent] > 0 and draw(st.integers(0, 3)) == 0:
+            # A window defined backward from its end, kept within the guaranteed elapsed time.
+            back = draw(st.integers(1, slack[parent]))
+            windows[name] = WindowConfig(f"end - {back}d", parent, start_inclusive, end_inclusive, has=has)
+            slack[f"{name}.start"] = slack[parent] - back
+            continue
+
+        offset = draw(st.integers(1, 2)) if draw(st.integers(0, 4)) == 0 else 0
+        start = f"{parent} + {offset}d" if offset else parent
         if draw(st.booleans()):
-            end = f"start + {draw(st.integers(1, 7))}d"
+            size = draw(st.integers(1, 7))
+            end = f"start + {size}d"
+            slack[f"{name}.end"] = slack[parent] + offset + size
         elif draw(st.integers(0, 9)) == 0:
             end = None
         else:
             end = f"start -> {draw(st.sampled_from(PREDICATES))}"
-        has = {p: draw(st.sampled_from(CONSTRAINTS)) for p in PREDICATES if draw(st.integers(0, 3)) == 0}
-        windows[name] = WindowConfig(start, end, draw(st.booleans()), draw(st.booleans()), has=has)
-        if end is not None:
-            ends.append(f"{name}.end")
+            slack[f"{name}.end"] = 0
+        windows[name] = WindowConfig(start, end, start_inclusive, end_inclusive, has=has)
 
     label_window = draw(st.sampled_from([n for n in windows if n != "input"]))
     windows[label_window].label = draw(st.sampled_from(PREDICATES))
@@ -91,14 +105,129 @@ def meds_data(draw: st.DrawFn) -> pl.DataFrame:
     ).sort("subject_id", "time")
 
 
-@settings(
+SETTINGS = settings(
     max_examples=int(os.environ.get("HYPOTHESIS_MAX_EXAMPLES", "60")),
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
+
+
+@SETTINGS
 @given(task_configs(), meds_data())
 def test_normalization_preserves_labels(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame):
     """The normalized config, anchored at the original rows, reproduces them exactly."""
     original = extract(task_cfg, MEDS_df)
     normalized = extract_at(normalize(task_cfg), MEDS_df, original.select("subject_id", "prediction_time"))
     assert normalized.equals(original), f"\noriginal:\n{original}\nnormalized:\n{normalized}"
+
+
+@SETTINGS
+@given(task_configs())
+def test_normalization_is_structurally_normal(task_cfg: TaskExtractorConfig):
+    """Every branch chains start to end, has criteria only on its last window, and never looks back."""
+    normalized = normalize(task_cfg)
+    assert normalized.label_branch.terminal.label is not None
+    for branch in normalized.branches:
+        assert all(not e.is_constrained for e in branch.edges[:-1])
+        assert all(e.days is None or e.days > 0 for e in branch.edges)
+        if branch.is_label_branch:
+            assert not branch.terminal.is_constrained
+    for name, window in normalized.windows.items():
+        assert window.root_node == "start", name
+        assert window.start == "trigger" or window.start.endswith(".end"), (name, window.start)
+
+
+def test_lookback_past_prediction_time_is_rejected():
+    """A window that could reach before the prediction time is not guaranteeably future-only."""
+    cfg = TaskExtractorConfig(
+        predicates={c: PlainPredicateConfig(c) for c in CODES},
+        trigger=EventConfig("A"),
+        windows={
+            "input": WindowConfig("trigger", "start + 1d", False, True, index_timestamp="end"),
+            "stay": WindowConfig("input.end", "start -> B", False, True),
+            "last_day": WindowConfig("end - 1d", "stay.end", False, True, has={"C": "(None, 0)"}),
+            "target": WindowConfig("stay.end", "start + 7d", False, True, label="D"),
+        },
+    )
+    with pytest.raises(ValueError, match="across the event-bounded window 'stay'"):
+        normalize(cfg)
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Unconstrained configurations: anything ACES accepts. Normalization must either reject the configuration
+# (it is not future-only, or not expressible as start-rooted chains) or reproduce ACES's labels exactly.
+# ----------------------------------------------------------------------------------------------------------
+
+RELATIVE_FORMS = ["start + {k}d", "start -> {p}", "end - {k}d", "end <- {p}"]
+
+
+@st.composite
+def arbitrary_task_configs(draw: st.DrawFn, criteria: bool = True) -> TaskExtractorConfig:
+    """A random ACES configuration with no structural restrictions beyond what ACES itself accepts.
+
+    Windows reference any earlier endpoint (or the trigger) with any offset form, forward or backward,
+    temporal or event-bounded, or a record boundary; the index timestamp and label land on any window.
+    Configurations ACES rejects are discarded.
+
+    Args:
+        draw: Hypothesis's draw function.
+        criteria: Whether windows may carry inclusion / exclusion criteria.
+    """
+    predicates = {c: PlainPredicateConfig(c) for c in CODES}
+    predicates["A_or_B"] = DerivedPredicateConfig("or(A, B)")
+
+    n = draw(st.integers(1, 5))
+    refs = ["trigger"]
+    windows: dict[str, WindowConfig] = {}
+    for i in range(n):
+        name = f"w{i}"
+        k, p = draw(st.integers(1, 7)), draw(st.sampled_from(PREDICATES))
+        ref = draw(st.sampled_from(refs))
+        external = draw(
+            st.sampled_from([ref, f"{ref} + {k}d", f"{ref} - {k}d", f"{ref} -> {p}", f"{ref} <- {p}"])
+        )
+        k2, p2 = draw(st.integers(1, 7)), draw(st.sampled_from(PREDICATES))
+        if draw(st.booleans()):
+            start = external
+            end = draw(st.sampled_from([None, f"start + {k2}d", f"start -> {p2}"]))
+        else:
+            start = draw(st.sampled_from([None, f"end - {k2}d", f"end <- {p2}"]))
+            end = external
+        has = {}
+        if criteria:
+            has = {q: draw(st.sampled_from(CONSTRAINTS)) for q in PREDICATES if draw(st.integers(0, 3)) == 0}
+        try:
+            windows[name] = WindowConfig(start, end, draw(st.booleans()), draw(st.booleans()), has=has)
+        except ValueError:
+            assume(False)
+        refs.extend([f"{name}.start", f"{name}.end"])
+
+    names = list(windows)
+    windows[draw(st.sampled_from(names))].index_timestamp = draw(st.sampled_from(["start", "end"]))
+    windows[draw(st.sampled_from(names))].label = draw(st.sampled_from(PREDICATES))
+
+    try:
+        return TaskExtractorConfig(predicates=predicates, trigger=EventConfig("A"), windows=windows)
+    except (ValueError, KeyError, TypeError):
+        assume(False)
+
+
+@SETTINGS
+@given(arbitrary_task_configs(), meds_data())
+def test_normalization_rejects_or_preserves(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame):
+    """On arbitrary ACES configurations, normalization either raises `ValueError` or matches ACES."""
+    try:
+        normalized = normalize(task_cfg)
+    except ValueError:
+        event("rejected as not normalizable")
+        return
+
+    try:
+        original = extract(task_cfg, MEDS_df)
+    except Exception:
+        event("ACES failed on the original configuration")
+        return
+
+    event("normalized and compared")
+    anchored = extract_at(normalized, MEDS_df, original.select("subject_id", "prediction_time"))
+    assert anchored.equals(original), f"\noriginal:\n{original}\nnormalized:\n{anchored}"

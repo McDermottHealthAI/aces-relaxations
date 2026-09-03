@@ -23,7 +23,9 @@ from aces.predicates import get_predicates_df
 from aces.query import query
 from omegaconf import DictConfig
 
+from .future_only import backward_edge_reason
 from .normalization import INDEX_PREDICATE
+from .tree import WindowNode, prediction_time_node, resolve_node
 
 SUBJECT_ID = "subject_id"
 PREDICTION_TIME = "prediction_time"
@@ -71,29 +73,48 @@ def get_predicates(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.D
         return get_predicates_df(copy.deepcopy(task_cfg), DictConfig({"path": fp.name, "standard": "meds"}))
 
 
-def _tidy(result: pl.DataFrame) -> pl.DataFrame:
+def _node_time(task_cfg: TaskExtractorConfig, ref: WindowNode) -> pl.Expr:
+    """The realized timestamp of a (resolved) window-endpoint node in an ACES result.
+
+    A node's summary holds the timestamps of both ends of the edge into it, named by traversal direction
+    rather than by time, so the node itself is the later one for a forward edge and the earlier one for a
+    backward edge. (ACES's own ``index_timestamp`` column uses the names literally, which for a window defined
+    backward from its end reports the wrong endpoint; the helpers here therefore take the prediction time from
+    the tree instead.)
+    """
+    if ref.root is None:
+        return pl.col("trigger")
+    summary = pl.col(f"{ref.node_name}_summary").struct
+    ends = [summary.field("timestamp_at_start"), summary.field("timestamp_at_end")]
+    forward = backward_edge_reason(task_cfg.window_nodes[ref.node_name]) is None
+    return pl.max_horizontal(ends) if forward else pl.min_horizontal(ends)
+
+
+def _prediction_time(task_cfg: TaskExtractorConfig) -> pl.Expr:
+    return _node_time(task_cfg, prediction_time_node(task_cfg)).cast(pl.Datetime("us")).alias(PREDICTION_TIME)
+
+
+def _tidy(task_cfg: TaskExtractorConfig, result: pl.DataFrame) -> pl.DataFrame:
     """Reduces an ACES result to ``(subject_id, prediction_time, boolean_value)``, sorted and deduplicated.
 
     Rows whose prediction time or label is null are dropped: ACES emits such rows when a window's end falls
     before its start (e.g. a window to the end of the record anchored after the last event), and they cannot
     be prediction-task rows.
     """
-    empty = len(result) == 0 or "index_timestamp" not in result.columns or "label" not in result.columns
-    if not empty:
-        result = result.drop_nulls(subset=["index_timestamp", "label"])
-    if empty or len(result) == 0:
-        return pl.DataFrame(
-            schema={SUBJECT_ID: pl.Int64, PREDICTION_TIME: pl.Datetime("us"), BOOLEAN_VALUE: pl.Boolean}
-        )
-    return (
+    schema = {SUBJECT_ID: pl.Int64, PREDICTION_TIME: pl.Datetime("us"), BOOLEAN_VALUE: pl.Boolean}
+    if len(result) == 0 or "label" not in result.columns:
+        return pl.DataFrame(schema=schema)
+    tidy = (
         result.select(
             pl.col(SUBJECT_ID).cast(pl.Int64),
-            pl.col("index_timestamp").cast(pl.Datetime("us")).alias(PREDICTION_TIME),
+            _prediction_time(task_cfg),
             (pl.col("label") > 0).alias(BOOLEAN_VALUE),
         )
+        .drop_nulls()
         .unique()
         .sort(SUBJECT_ID, PREDICTION_TIME)
     )
+    return tidy if len(tidy) else pl.DataFrame(schema=schema)
 
 
 def extract(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.DataFrame:
@@ -119,7 +140,7 @@ def extract(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.DataFram
         └────────────┴─────────────────────┴───────────────┘
     """
     with _quiet():
-        return _tidy(query(copy.deepcopy(task_cfg), get_predicates(task_cfg, MEDS_df)))
+        return _tidy(task_cfg, query(copy.deepcopy(task_cfg), get_predicates(task_cfg, MEDS_df)))
 
 
 def with_index_events(
@@ -214,7 +235,7 @@ def extract_at(
     """
     with _quiet():
         predicates_df = with_index_events(get_predicates(task_cfg, MEDS_df), index_df, index_predicate)
-        return _tidy(query(copy.deepcopy(task_cfg), predicates_df))
+        return _tidy(task_cfg, query(copy.deepcopy(task_cfg), predicates_df))
 
 
 def prediction_times(result: pl.DataFrame) -> list[tuple[int, datetime]]:
@@ -225,3 +246,82 @@ def prediction_times(result: pl.DataFrame) -> list[tuple[int, datetime]]:
         [(1, datetime.datetime(2020, 1, 2, 0, 0)), (2, datetime.datetime(2020, 1, 2, 0, 0))]
     """
     return list(result.select(SUBJECT_ID, PREDICTION_TIME).iter_rows())
+
+
+def extract_label_window_bounds(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.DataFrame:
+    """Extracts, per row, the realized start and end timestamps of the label window.
+
+    This exposes what ACES actually resolved the label window to on real data, which is how the structural
+    future-only property can be checked empirically: a guaranteeably future-only task never yields a label
+    window starting before its prediction time.
+
+    Args:
+        task_cfg: A task configuration with a label and an index timestamp.
+        MEDS_df: A MEDS-format dataframe.
+
+    Returns:
+        ``subject_id``, ``prediction_time``, ``label_window_start``, ``label_window_end``, sorted.
+
+    Examples:
+        >>> extract_label_window_bounds(sample_ACES_cfg, sample_MEDS_df)
+        shape: (2, 4)
+        ┌────────────┬─────────────────────┬─────────────────────┬─────────────────────┐
+        │ subject_id ┆ prediction_time     ┆ label_window_start  ┆ label_window_end    │
+        │ ---        ┆ ---                 ┆ ---                 ┆ ---                 │
+        │ i64        ┆ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        │
+        ╞════════════╪═════════════════════╪═════════════════════╪═════════════════════╡
+        │ 1          ┆ 2020-01-02 00:00:00 ┆ 2020-01-03 00:00:00 ┆ 2020-01-05 00:00:00 │
+        │ 2          ┆ 2020-01-02 00:00:00 ┆ 2020-01-03 00:00:00 ┆ 2020-01-04 00:00:00 │
+        └────────────┴─────────────────────┴─────────────────────┴─────────────────────┘
+
+    A label window that looks back from the next ``B`` event can start before the prediction time:
+
+        >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", False, True, index_timestamp="end"),
+        ...         "target": WindowConfig("end - 3d", "input.end -> B", False, True, label="A"),
+        ...     },
+        ... )
+        >>> df = pl.DataFrame({
+        ...     "subject_id": [1, 1, 1],
+        ...     "time": [datetime(2020, 1, 1), datetime(2020, 1, 3), datetime(2020, 1, 5)],
+        ...     "code": ["A", "B", "A"],
+        ...     "numeric_value": [None, None, None],
+        ... })
+        >>> extract_label_window_bounds(cfg, df)
+        shape: (1, 4)
+        ┌────────────┬─────────────────────┬─────────────────────┬─────────────────────┐
+        │ subject_id ┆ prediction_time     ┆ label_window_start  ┆ label_window_end    │
+        │ ---        ┆ ---                 ┆ ---                 ┆ ---                 │
+        │ i64        ┆ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        │
+        ╞════════════╪═════════════════════╪═════════════════════╪═════════════════════╡
+        │ 1          ┆ 2020-01-02 00:00:00 ┆ 2019-12-31 00:00:00 ┆ 2020-01-03 00:00:00 │
+        └────────────┴─────────────────────┴─────────────────────┴─────────────────────┘
+    """
+    with _quiet():
+        result = query(copy.deepcopy(task_cfg), get_predicates(task_cfg, MEDS_df))
+
+    schema = {
+        SUBJECT_ID: pl.Int64,
+        PREDICTION_TIME: pl.Datetime("us"),
+        "label_window_start": pl.Datetime("us"),
+        "label_window_end": pl.Datetime("us"),
+    }
+    if len(result) == 0 or "label" not in result.columns:
+        return pl.DataFrame(schema=schema)
+
+    def realized(side: str) -> pl.Expr:
+        ref = resolve_node(task_cfg, root_node=WindowNode(task_cfg.label_window, side))
+        return _node_time(task_cfg, ref).cast(pl.Datetime("us")).alias(f"label_window_{side}")
+
+    return (
+        result.select(
+            pl.col(SUBJECT_ID).cast(pl.Int64), _prediction_time(task_cfg), realized("start"), realized("end")
+        )
+        .drop_nulls(subset=[PREDICTION_TIME])
+        .unique()
+        .sort(SUBJECT_ID, PREDICTION_TIME)
+    )
