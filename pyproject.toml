@@ -17,6 +17,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    "bigtree>=0.31.2",
+    "es-aces>=0.7.3",
 ]
 
 [dependency-groups]
@@ -79,7 +81,7 @@ select = [
 "test_*" = ["DTZ001"]  # Ignore datetimez in test files
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*", "*NRT*", "D", "L"] # "D" is used for distributions/datasets
+extend-ignore-names = ["*MEDS*", "*ACES*", "*NRT*", "D", "L"] # "D" is used for distributions/datasets
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
