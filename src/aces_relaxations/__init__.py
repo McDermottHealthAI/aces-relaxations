@@ -19,6 +19,7 @@ from .constraint_simplification import (
     classify_constraint,
     simplify_constraints,
 )
+from .extraction import extract, extract_at, get_predicates, with_index_events
 from .future_only import future_only_violations, is_future_only, validate_future_only
 from .printing import get_constraint_str, print_ACES
 from .relaxations import (
