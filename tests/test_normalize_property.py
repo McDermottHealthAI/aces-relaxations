@@ -23,6 +23,7 @@ from hypothesis import HealthCheck, assume, event, given, settings
 from hypothesis import strategies as st
 
 from aces_relaxations.extraction import extract, extract_at
+from aces_relaxations.future_only import is_future_only
 from aces_relaxations.normalization import normalize
 
 CODES = ["A", "B", "C", "D"]
@@ -32,8 +33,15 @@ EPOCH = datetime(2020, 1, 1)
 
 
 @st.composite
-def task_configs(draw: st.DrawFn) -> TaskExtractorConfig:
-    """A random future-only task: a temporal input window, then a random tree of future windows."""
+def task_configs(draw: st.DrawFn, end_rooted: bool = False) -> TaskExtractorConfig:
+    """A random future-only task: a temporal input window, then a random tree of future windows.
+
+    Args:
+        draw: Hypothesis's draw function.
+        end_rooted: Whether to also emit look-backs that only the universal normalized form can express: a
+            fixed look-back across an event-bounded window (within the *cumulative* guaranteed time) and a
+            look-back to a prior event that the path guarantees (by having hopped to it).
+    """
     predicates = {c: PlainPredicateConfig(c) for c in CODES}
     predicates["A_or_B"] = DerivedPredicateConfig("or(A, B)")
 
@@ -46,20 +54,37 @@ def task_configs(draw: st.DrawFn) -> TaskExtractorConfig:
     )
 
     n_future = draw(st.integers(1, 4))
-    # For every referenceable endpoint, the days of temporal windows since the prediction time or the last
-    # event-bounded endpoint: how far a window may look back from it and still be a start-rooted chain.
+    # For every referenceable endpoint: the days of temporal windows since the last event-bounded endpoint
+    # (how far a look-back can go and still be a start-rooted chain), the cumulative guaranteed days since
+    # the prediction time, and the events the path to it guarantees to have occurred after the prediction
+    # time (those it hopped to).
     slack: dict[str, int] = {"input.end": 0}
+    total: dict[str, int] = {"input.end": 0}
+    hopped: dict[str, list[str]] = {"input.end": []}
     for i in range(n_future):
         name = f"w{i}"
         parent = draw(st.sampled_from(sorted(slack)))
         has = {p: draw(st.sampled_from(CONSTRAINTS)) for p in PREDICATES if draw(st.integers(0, 3)) == 0}
         start_inclusive, end_inclusive = draw(st.booleans()), draw(st.booleans())
 
-        if slack[parent] > 0 and draw(st.integers(0, 3)) == 0:
+        limit = total[parent] if end_rooted else slack[parent]
+        if limit > 0 and draw(st.integers(0, 3)) == 0:
             # A window defined backward from its end, kept within the guaranteed elapsed time.
-            back = draw(st.integers(1, slack[parent]))
+            back = draw(st.integers(1, limit))
             windows[name] = WindowConfig(f"end - {back}d", parent, start_inclusive, end_inclusive, has=has)
-            slack[f"{name}.start"] = slack[parent] - back
+            slack[f"{name}.start"] = max(slack[parent] - back, 0)
+            total[f"{name}.start"] = total[parent] - back
+            hopped[f"{name}.start"] = []
+            continue
+        if end_rooted and hopped[parent] and draw(st.integers(0, 3)) == 0:
+            # A look-back to a prior event the path is guaranteed to have passed.
+            # ACES includes the end event itself in a `<-` search exactly when `start_inclusive` is set,
+            # which is what makes the hopped-to event the guaranteed target.
+            p = draw(st.sampled_from(hopped[parent]))
+            windows[name] = WindowConfig(f"end <- {p}", parent, True, end_inclusive, has=has)
+            slack[f"{name}.start"] = 0
+            total[f"{name}.start"] = 0
+            hopped[f"{name}.start"] = []
             continue
 
         offset = draw(st.integers(1, 2)) if draw(st.integers(0, 4)) == 0 else 0
@@ -68,11 +93,16 @@ def task_configs(draw: st.DrawFn) -> TaskExtractorConfig:
             size = draw(st.integers(1, 7))
             end = f"start + {size}d"
             slack[f"{name}.end"] = slack[parent] + offset + size
+            total[f"{name}.end"] = total[parent] + offset + size
+            hopped[f"{name}.end"] = hopped[parent]
         elif draw(st.integers(0, 9)) == 0:
             end = None
         else:
-            end = f"start -> {draw(st.sampled_from(PREDICATES))}"
+            p = draw(st.sampled_from(PREDICATES))
+            end = f"start -> {p}"
             slack[f"{name}.end"] = 0
+            total[f"{name}.end"] = total[parent] + offset
+            hopped[f"{name}.end"] = [*hopped[parent], p]
         windows[name] = WindowConfig(start, end, start_inclusive, end_inclusive, has=has)
 
     label_window = draw(st.sampled_from([n for n in windows if n != "input"]))
@@ -119,6 +149,16 @@ def test_normalization_preserves_labels(task_cfg: TaskExtractorConfig, MEDS_df: 
     original = extract(task_cfg, MEDS_df)
     normalized = extract_at(normalize(task_cfg), MEDS_df, original.select("subject_id", "prediction_time"))
     assert normalized.equals(original), f"\noriginal:\n{original}\nnormalized:\n{normalized}"
+
+
+@SETTINGS
+@given(task_configs(end_rooted=True), meds_data())
+def test_universal_normalization_preserves_labels(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame):
+    """The universal form (end-rooted windows allowed) also reproduces the original rows exactly."""
+    original = extract(task_cfg, MEDS_df)
+    normalized = normalize(task_cfg, allow_end_rooted=True)
+    anchored = extract_at(normalized, MEDS_df, original.select("subject_id", "prediction_time"))
+    assert anchored.equals(original), f"\noriginal:\n{original}\nnormalized:\n{anchored}"
 
 
 @SETTINGS
@@ -213,11 +253,13 @@ def arbitrary_task_configs(draw: st.DrawFn, criteria: bool = True) -> TaskExtrac
 
 
 @SETTINGS
-@given(arbitrary_task_configs(), meds_data())
-def test_normalization_rejects_or_preserves(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame):
-    """On arbitrary ACES configurations, normalization either raises `ValueError` or matches ACES."""
+@given(arbitrary_task_configs(), meds_data(), st.booleans())
+def test_normalization_rejects_or_preserves(
+    task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame, allow_end_rooted: bool
+):
+    """On arbitrary ACES configurations, either form of normalization raises `ValueError` or matches ACES."""
     try:
-        normalized = normalize(task_cfg)
+        normalized = normalize(task_cfg, allow_end_rooted=allow_end_rooted)
     except ValueError:
         event("rejected as not normalizable")
         return
@@ -231,3 +273,23 @@ def test_normalization_rejects_or_preserves(task_cfg: TaskExtractorConfig, MEDS_
     event("normalized and compared")
     anchored = extract_at(normalized, MEDS_df, original.select("subject_id", "prediction_time"))
     assert anchored.equals(original), f"\noriginal:\n{original}\nnormalized:\n{anchored}"
+
+
+@SETTINGS
+@given(arbitrary_task_configs())
+def test_forms_are_consistent(task_cfg: TaskExtractorConfig):
+    """The strict form is a special case of the universal one, and both imply the future-only property."""
+    try:
+        strict = normalize(task_cfg)
+    except ValueError:
+        strict = None
+    try:
+        universal = normalize(task_cfg, allow_end_rooted=True)
+    except ValueError:
+        universal = None
+
+    if strict is not None:
+        assert universal is not None
+        assert universal.branches == strict.branches
+    if universal is not None:
+        assert is_future_only(task_cfg)
