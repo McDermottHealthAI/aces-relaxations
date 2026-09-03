@@ -5,9 +5,11 @@ after (or at) the prediction time. Structurally, this means that both endpoints 
 reachable from the prediction-time node in the ACES window tree, and that every edge on those paths moves
 forward in time (a non-negative temporal offset, or a bound to a *next* rather than *prior* event).
 
-This is a conservative, purely structural check: it can reject configurations that happen to be future-only
-in practice (e.g. a label window whose start is ``end - 1d`` where the end is ``prediction_time + 1d``), but
-it never accepts a configuration whose label could reach into the past of the prediction time.
+This is a conservative, purely structural check. A backward temporal edge is accepted when the *guaranteed*
+elapsed time so far along the path (the sum of the temporal edges; event-bounded edges guarantee nothing)
+covers it, so a label window whose start is ``end - 1d`` where the end is ``prediction_time + 7d`` passes,
+while one that looks back across an event-bounded edge does not. The check never accepts a configuration
+whose label could reach into the past of the prediction time.
 
 Windows hanging off the prediction-time-to-label path (rather than lying on it, or after the label) are not
 inspected, because [`strip_to_relevant_windows`][aces_relaxations.relaxations.strip_to_relevant_windows]
@@ -186,13 +188,21 @@ def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
             continue
 
         path = list(node.node_path)
+        elapsed = timedelta(0)
         for step in path[path.index(pt) + 1 :]:
+            bound = step.endpoint_expr
             reason = backward_edge_reason(step)
-            if reason is not None:
-                violations[
-                    f"The edge into {step.node_name} on the path from the prediction time to the label "
-                    f"window can move backward in time: {reason}."
-                ] = None
+            if reason is None:
+                if isinstance(bound, TemporalWindowBounds):
+                    elapsed += bound.window_size
+                continue
+            if isinstance(bound, TemporalWindowBounds) and -bound.window_size <= elapsed:
+                elapsed += bound.window_size
+                continue
+            violations[
+                f"The edge into {step.node_name} on the path from the prediction time to the label "
+                f"window can move backward in time: {reason}."
+            ] = None
 
     return list(violations)
 

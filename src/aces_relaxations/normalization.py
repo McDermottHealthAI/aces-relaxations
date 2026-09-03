@@ -21,6 +21,10 @@ The result is a genuine ACES configuration whose trigger is a synthetic *index e
 prediction time, so it can be run through ACES itself (see ``aces_relaxations.extraction``), and whose
 branches are exposed for downstream converters.
 
+Windows defined backward from a later endpoint (``start: end - 1d``) are allowed when they cannot reach before
+the prediction time, i.e. when the guaranteed elapsed time along the path (the sum of the temporal windows
+on it; event-bounded windows guarantee nothing) covers the look-back; they are rewritten as forward chains.
+
 Why this is label-preserving: with every edge in the prediction-time subtree moving forward in time, the
 timestamp of every window endpoint is a deterministic function of the data and the prediction time, computed
 along its path from the root. Copying a path therefore realizes exactly the same endpoints, so a criterion
@@ -43,7 +47,7 @@ from aces.types import TemporalWindowBounds, ToEventWindowBounds
 from bigtree import Node
 
 from .future_only import backward_edge_reason, validate_future_only
-from .tree import label_node, prediction_time_node
+from .tree import prediction_time_node
 
 logger = logging.getLogger(__name__)
 
@@ -237,60 +241,133 @@ def _constraints_str(constraints: Mapping[str, Constraint]) -> str:
     return ", ".join(f"{p}: ({lo}, {hi})" for p, (lo, hi) in constraints.items())
 
 
-def _edge_name(task_cfg: TaskExtractorConfig, node: Node) -> str:
-    """Names the window realized by the edge into ``node``."""
-    window_name, side = node.node_name.rsplit(".", 1)
-    window = task_cfg.windows[window_name]
-    if side == window.root_node:
-        # The node was reached by an offset from the window's reference, i.e. the edge is the gap between
-        # the referenced node and this window, not the window itself.
-        return f"{window_name}_{side}_gap"
-    return window_name
+def _own_node_name(window_name: str, window: WindowConfig) -> str:
+    """The name of the node that carries a window's criteria and label (the far end of its span)."""
+    return f"{window_name}.{'start' if window.root_node == 'end' else 'end'}"
 
 
-def _path_edges(task_cfg: TaskExtractorConfig, root: Node, leaf: Node) -> list[Edge]:
-    """The edges of the path from ``root`` (exclusive) to ``leaf`` (inclusive)."""
-    label_name = label_node(task_cfg).node_name
-    label = task_cfg.windows[task_cfg.label_window].label
+def _rewind(stack: list[Edge], days: timedelta, window_name: str) -> list[Edge]:
+    """Moves the current position back by ``days`` along a chain of unconstrained windows.
+
+    Only temporal windows can be rewound through, because only they contribute *guaranteed* elapsed time:
+    an event-bounded window may be arbitrarily short, so looking back across one could reach before the
+    prediction time.
+
+    Examples:
+        >>> a = Edge("a", TemporalWindowBounds(False, timedelta(days=7), True))
+        >>> for e in _rewind([a], timedelta(days=1), "b"): print(e)
+        a__pre_b: start + 6 days
+        >>> _rewind([a], timedelta(days=7), "b")
+        []
+        >>> _rewind([a], timedelta(days=8), "b")
+        Traceback (most recent call last):
+            ...
+        ValueError: Window 'b' looks back 8 days, reaching before the prediction time.
+        >>> e = Edge("e", ToEventWindowBounds(False, "discharge", True))
+        >>> _rewind([a, e], timedelta(days=1), "b")
+        Traceback (most recent call last):
+            ...
+        ValueError: Window 'b' looks back 1 day across the event-bounded window 'e', so it is not
+        guaranteeably future-only.
+    """
+    out = list(stack)
+    remaining = days
+    while remaining > timedelta(0):
+        if not out:
+            raise ValueError(
+                f"Window '{window_name}' looks back {_render_timedelta(days)}, reaching before the "
+                "prediction time."
+            )
+        top = out.pop()
+        if not top.is_temporal:
+            raise ValueError(
+                f"Window '{window_name}' looks back {_render_timedelta(days)} across the event-bounded "
+                f"window '{top.name}', so it is not guaranteeably future-only."
+            )
+        if top.bound.window_size > remaining:
+            shortened = TemporalWindowBounds(
+                top.bound.left_inclusive, top.bound.window_size - remaining, False
+            )
+            out.append(Edge(f"{top.name}__pre_{window_name}", shortened))
+            remaining = timedelta(0)
+        else:
+            remaining -= top.bound.window_size
+    return out
+
+
+def _walk(task_cfg: TaskExtractorConfig, root: Node, leaf: Node) -> Iterator[Branch]:
+    """Yields the branches contributed by one root-to-leaf path of the prediction-time subtree.
+
+    The walk keeps a chain of unconstrained windows from the prediction time to the current position.
+    Forward edges extend it; a window carrying criteria contributes a branch ending in that window; the
+    label window contributes the label branch; an unconstrained leaf contributes its (realizability)
+    branch. A backward temporal edge rewinds the position instead (see ``_rewind``): a window defined from
+    its end backward is emitted as a forward window from the rewound position, and its descendants continue
+    from there.
+
+    Examples:
+        >>> from aces.config import EventConfig, PlainPredicateConfig, TaskExtractorConfig, WindowConfig
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "week": WindowConfig("input.end", "start + 7d", False, True, label="B"),
+        ...         "last_day": WindowConfig("end - 1d", "week.end", False, True, has={"A": "(1, None)"}),
+        ...         "after": WindowConfig(
+        ...             "last_day.start", "start + 2d", False, True, has={"B": "(None, 0)"}
+        ...         ),
+        ...     },
+        ... )
+        >>> root = cfg.window_nodes["input.end"]
+        >>> for leaf in root.leaves:
+        ...     for b in _walk(cfg, root, leaf): print(b)
+        week: start + 7 days; label=B
+        week__pre_last_day: start + 6 days -> last_day: start + 1 day (A: (1, None))
+        week__pre_last_day: start + 6 days -> after: start + 2 days (B: (None, 0))
+    """
+    label_window = task_cfg.label_window
+    label_own = _own_node_name(label_window, task_cfg.windows[label_window])
+    label = task_cfg.windows[label_window].label
 
     path = list(leaf.node_path)
-    edges = []
-    for node in path[path.index(root) + 1 :]:
+    steps = path[path.index(root) + 1 :]
+    stack: list[Edge] = []
+    for i, node in enumerate(steps):
+        window_name, side = node.node_name.rsplit(".", 1)
+        window = task_cfg.windows[window_name]
+        is_own = node.node_name == _own_node_name(window_name, window)
         constraints = tuple(
             sorted((p, tuple(c)) for p, c in (getattr(node, "constraints", None) or {}).items())
         )
-        edges.append(
-            Edge(
-                name=_edge_name(task_cfg, node),
-                bound=node.endpoint_expr,
-                constraints=constraints,
-                label=label if node.node_name == label_name else None,
+        node_label = label if node.node_name == label_own else None
+        is_leaf = i == len(steps) - 1
+        bound = node.endpoint_expr
+
+        if backward_edge_reason(node) is None:
+            name = window_name if is_own else f"{window_name}_{side}_gap"
+            edge = Edge(name, bound, constraints, node_label)
+            if edge.is_constrained:
+                yield Branch((*stack, replace(edge, label=None)))
+            if node_label is not None or (is_leaf and not edge.is_constrained):
+                yield Branch((*stack, edge.unconstrained()))
+            stack.append(edge.unconstrained())
+            continue
+
+        if not isinstance(bound, TemporalWindowBounds):
+            raise ValueError(
+                f"Window '{window_name}' is bound to a prior event after the prediction time, so it is not "
+                "guaranteeably future-only."
             )
-        )
-    return edges
-
-
-def _split_branches(path: list[Edge]) -> Iterator[Branch]:
-    """Yields the branches a single root-to-leaf path contributes.
-
-    Examples:
-        >>> gap = Edge("gap", TemporalWindowBounds(False, timedelta(days=1), True), (("death", (None, 0)),))
-        >>> target = Edge(
-        ...     "target", ToEventWindowBounds(False, "discharge", True), (("admission", (None, 0)),), "death"
-        ... )
-        >>> for b in _split_branches([gap, target]): print(b)
-        gap: start + 1 day (death: (None, 0))
-        gap: start + 1 day -> target: start -> discharge (admission: (None, 0))
-        gap: start + 1 day -> target: start -> discharge; label=death
-    """
-    prefix: list[Edge] = []
-    for i, edge in enumerate(path):
-        is_leaf = i == len(path) - 1
-        if edge.is_constrained:
-            yield Branch((*prefix, replace(edge, label=None)))
-        if edge.label is not None or (is_leaf and not edge.is_constrained):
-            yield Branch((*prefix, edge.unconstrained()))
-        prefix.append(edge.unconstrained())
+        days = -bound.window_size
+        stack = _rewind(stack, days, window_name)
+        if is_own:
+            own_bound = TemporalWindowBounds(window.start_inclusive, days, window.end_inclusive)
+            edge = Edge(window_name, own_bound, constraints, node_label)
+            if edge.is_constrained:
+                yield Branch((*stack, replace(edge, label=None)))
+            if node_label is not None:
+                yield Branch((*stack, edge.unconstrained()))
 
 
 def _collapse(branch: Branch) -> Branch:
@@ -354,10 +431,8 @@ def _future_leaves(root: Node) -> list[Node]:
 
     A child of the prediction-time node reached by a backward edge lies (at least partly) before the
     prediction time: it is cohort selection, not a condition on the future, and is discarded with a warning.
-    A backward edge deeper in a forward branch has no such reading and is an error.
     """
     leaves: list[Node] = []
-    violations: list[str] = []
     for child in root.children:
         reason = backward_edge_reason(child)
         if reason is not None:
@@ -366,17 +441,7 @@ def _future_leaves(root: Node) -> list[Node]:
                 f"({reason})."
             )
             continue
-        for node in child.descendants:
-            reason = backward_edge_reason(node)
-            if reason is not None:
-                violations.append(f"the edge into {node.node_name} can move backward in time ({reason})")
         leaves.extend([child] if child.is_leaf else child.leaves)
-    if violations:
-        raise ValueError(
-            "Not every window branching from the prediction time is future-only: "
-            + "; ".join(violations)
-            + "."
-        )
     return leaves
 
 
@@ -390,8 +455,9 @@ def branches(task_cfg: TaskExtractorConfig) -> tuple[Branch, ...]:
         The branches, label branch first, then the others in tree order.
 
     Raises:
-        ValueError: If the configuration is not future-only, or a window branching from the prediction time
-            can move backward in time.
+        ValueError: If the configuration is not future-only, or a window after the prediction time is not
+            guaranteeably future-only (it looks back further than the guaranteed elapsed time, or across an
+            event-bounded window).
 
     Examples:
         >>> for b in branches(in_hosp_mortality_cfg): print(b)
@@ -417,7 +483,7 @@ def branches(task_cfg: TaskExtractorConfig) -> tuple[Branch, ...]:
 
     seen: dict[Branch, None] = {}
     for leaf in _future_leaves(root):
-        for branch in _split_branches(_path_edges(task_cfg, root, leaf)):
+        for branch in _walk(task_cfg, root, leaf):
             seen[_collapse(branch)] = None
 
     ordered = list(seen)
@@ -488,8 +554,26 @@ def normalize(
             ├── (+5 days, 0:00:00) target.end; **Label: Presence of B**
             └── (next B) watch.end (no A)
 
+    Windows defined backward from a later endpoint are fine as long as they cannot reach before the
+    prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "week": WindowConfig("input.end", "start + 7d", False, True, label="B"),
+        ...         "last_day": WindowConfig("end - 1d", "week.end", False, True, has={"A": "(1, None)"}),
+        ...     },
+        ... )
+        >>> print_ACES(normalize(cfg))
+        trigger; **Prediction Time**
+        ├── (+7 days, 0:00:00) week.end; **Label: Presence of B**
+        └── (+6 days, 0:00:00) week__pre_last_day.end
+            └── (+1 day, 0:00:00) last_day.end (at least 1 A)
+
     Branches that start by moving backward from the prediction time lie before it and are discarded (with
-    a warning); a backward edge deeper inside a forward branch is rejected:
+    a warning); a window that could reach before the prediction time is rejected:
 
         >>> print_ACES(normalize(readmission_cfg))
         trigger; **Prediction Time**
@@ -511,8 +595,7 @@ def normalize(
         >>> normalize(cfg)
         Traceback (most recent call last):
             ...
-        ValueError: Not every window branching from the prediction time is future-only: the edge into
-        lookback.start can move backward in time (temporal bound -3 days, 0:00:00 is negative).
+        ValueError: Window 'lookback' looks back 3 days, reaching before the prediction time.
     """
     normalized_branches = branches(task_cfg)
 
