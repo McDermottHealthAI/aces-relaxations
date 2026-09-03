@@ -5,11 +5,11 @@ after (or at) the prediction time. Structurally, this means that both endpoints 
 reachable from the prediction-time node in the ACES window tree, and that every edge on those paths moves
 forward in time (a non-negative temporal offset, or a bound to a *next* rather than *prior* event).
 
-This is a conservative, purely structural check. A backward temporal edge is accepted when the *guaranteed*
-elapsed time so far along the path (the sum of the temporal edges; event-bounded edges guarantee nothing)
-covers it, so a label window whose start is ``end - 1d`` where the end is ``prediction_time + 7d`` passes,
-while one that looks back across an event-bounded edge does not. The check never accepts a configuration
-whose label could reach into the past of the prediction time.
+This is a conservative, purely structural check (see ``aces_relaxations.guarantees``). A look-back by a
+fixed offset is accepted when the position it reaches is guaranteed not to precede the prediction time; a
+look-back to a prior event is accepted when that event is guaranteed to occur between the prediction time
+and the look-back's end, because the path hopped to its next occurrence or a criterion on the path requires
+it. The check never accepts a configuration whose label could reach into the past of the prediction time.
 
 Windows hanging off the prediction-time-to-label path (rather than lying on it, or after the label) are not
 inspected, because [`strip_to_relevant_windows`][aces_relaxations.relaxations.strip_to_relevant_windows]
@@ -24,6 +24,8 @@ from aces.config import TaskExtractorConfig
 from aces.types import TemporalWindowBounds, ToEventWindowBounds
 from bigtree import Node, print_tree
 
+from .guarantees import PathState, anchor_counts
+from .predicates import predicate_expr
 from .tree import WindowNode, label_node, prediction_time_node, resolve_node
 
 
@@ -90,6 +92,41 @@ def backward_edge_reason(node: Node) -> str | None:
             return None
         case _ as other:
             raise ValueError(f"Unexpected type {type(other)} for endpoint expr: {other}.")
+
+
+def _implies(task_cfg: TaskExtractorConfig):
+    """``implies(g, p)``: an occurrence of predicate ``g`` is also an occurrence of predicate ``p``."""
+
+    def implies(g: str, p: str) -> bool:
+        if g == p:
+            return True
+        g_expr, p_expr = predicate_expr(task_cfg, g), predicate_expr(task_cfg, p)
+        if not p_expr.is_or_only:
+            return False
+        if g_expr.op == "and":
+            return bool(g_expr.leaves & p_expr.leaves)
+        return g_expr.leaves <= p_expr.leaves
+
+    return implies
+
+
+def _initial_state(task_cfg: TaskExtractorConfig, pt: Node) -> PathState:
+    """A path state at the prediction time.
+
+    If the prediction time is the trigger, or is itself the occurrence of an event (the endpoint of a ``-> P``
+    or ``<- P`` bound), that event is known to occur exactly at the prediction time, which lets an inclusive
+    look-back to it resolve to the prediction time itself. Likewise, if the prediction time is the start of
+    the record, windows bounded by the record start begin at the prediction time.
+    """
+    state = PathState(_implies(task_cfg))
+    bound = getattr(pt, "endpoint_expr", None)
+    if pt.node_name == "trigger":
+        state.guarantee_at_prediction_time(task_cfg.trigger.predicate)
+    elif isinstance(bound, ToEventWindowBounds):
+        event = bound.end_event.lstrip("-")
+        if event != "_RECORD_END":
+            state.guarantee_at_prediction_time(event)
+    return state
 
 
 def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
@@ -188,17 +225,32 @@ def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
             continue
 
         path = list(node.node_path)
-        elapsed = timedelta(0)
+        state = _initial_state(task_cfg, pt)
         for step in path[path.index(pt) + 1 :]:
             bound = step.endpoint_expr
             reason = backward_edge_reason(step)
+            before = state.pos
+            window_name, side = step.node_name.rsplit(".", 1)
+            window = task_cfg.windows[window_name]
+            counts = anchor_counts(window.start_inclusive, window.end_inclusive, side)
+            criteria = getattr(step, "constraints", None) or {}
             if reason is None:
                 if isinstance(bound, TemporalWindowBounds):
-                    elapsed += bound.window_size
+                    state.advance_temporal(bound.window_size)
+                else:
+                    state.advance_event(bound.end_event, strict=not counts)
+                state.add_criteria(criteria, before, state.pos)
                 continue
-            if isinstance(bound, TemporalWindowBounds) and -bound.window_size <= elapsed:
-                elapsed += bound.window_size
+            if isinstance(bound, TemporalWindowBounds) and state.can_look_back(-bound.window_size):
+                state.look_back_temporal(-bound.window_size)
+                state.add_criteria(criteria, state.pos, before)
                 continue
+            if isinstance(bound, ToEventWindowBounds) and bound.end_event.startswith("-"):
+                guarantee = state.guarantee_for(bound.end_event[1:], counts)
+                if guarantee is not None:
+                    state.look_back_event(guarantee)
+                    state.add_criteria(criteria, state.pos, before)
+                    continue
             violations[
                 f"The edge into {step.node_name} on the path from the prediction time to the label "
                 f"window can move backward in time: {reason}."

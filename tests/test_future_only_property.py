@@ -21,14 +21,26 @@ from aces.config import TaskExtractorConfig
 from hypothesis import event, given
 
 from aces_relaxations.extraction import extract_label_window_bounds
-from aces_relaxations.future_only import future_only_violations
+from aces_relaxations.future_only import backward_edge_reason, future_only_violations
+from aces_relaxations.tree import prediction_time_node
 from tests.test_normalize_property import CODES, EPOCH, SETTINGS, arbitrary_task_configs
 
 LOOKS_BACK = "can move backward in time"
 
 
-def sparse_population(seed: int, n_subjects: int = 40) -> pl.DataFrame:
-    """Many subjects with a handful of events each over a month, so look-backs have room to reach back.
+def _derived_by_look_back(task_cfg: TaskExtractorConfig) -> bool:
+    """Whether the prediction time is reached from the trigger through a backward edge."""
+    pt = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
+    return any(backward_edge_reason(node) is not None for node in pt.node_path)
+
+
+def sparse_population(seed: int, n_subjects: int = 100) -> pl.DataFrame:
+    """Many subjects with a moderate number of events each over a month.
+
+    The density is a compromise: sparse enough that a look-back to a prior event has room to reach before
+    the prediction time (it needs the event to be *absent* from an interval), dense enough that a short
+    fixed look-back from the next occurrence of an event can reach before it (it needs the event to be
+    *present* shortly after).
 
     The data are drawn with a fixed random generator rather than by hypothesis, so that the shrinker cannot
     search for a dataset on which a possible look-back happens not to occur: only the configuration is
@@ -37,7 +49,7 @@ def sparse_population(seed: int, n_subjects: int = 40) -> pl.DataFrame:
     rng = np.random.default_rng(seed)
     rows = []
     for subject_id in range(1, n_subjects + 1):
-        hours = np.sort(rng.integers(0, 24 * 30, size=rng.integers(4, 11)))
+        hours = np.sort(rng.integers(0, 24 * 30, size=rng.integers(8, 25)))
         for h in hours:
             rows.append((subject_id, EPOCH + timedelta(hours=int(h)), CODES[rng.integers(len(CODES))]))
     return pl.DataFrame(
@@ -57,7 +69,7 @@ def sparse_population(seed: int, n_subjects: int = 40) -> pl.DataFrame:
 
 
 POPULATIONS = [sparse_population(seed) for seed in range(4)]
-MIN_ROWS_FOR_A_VERDICT = 10
+MIN_ROWS_FOR_A_VERDICT = 50
 
 
 @SETTINGS
@@ -83,6 +95,12 @@ def test_future_only_verdict_matches_realized_windows(task_cfg: TaskExtractorCon
         assert n_back == 0, f"Guaranteed future-only, yet ACES realized {n_back} label window(s) in the past."
     elif len(bounds) < MIN_ROWS_FOR_A_VERDICT:
         event("too few rows realized; inconclusive")
+    elif _derived_by_look_back(task_cfg):
+        # The structural check ignores everything above the prediction time. When the prediction time is
+        # itself "the latest A before the next D", the path above it guarantees a D after the prediction
+        # time, which a later look-back to a prior D can rely on; the check cannot see that, so its
+        # "can look back" verdict is conservative and not empirically testable.
+        event("prediction time derived through a look-back; inconclusive")
     elif any(w.has for w in task_cfg.windows.values()):  # pragma: no cover - generated without criteria
         # Criteria can rule out exactly the rows on which the look-back would reach the past (e.g. "no A
         # before the trigger" keeps only first-event triggers, for which the record start is the

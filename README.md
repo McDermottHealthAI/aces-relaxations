@@ -189,12 +189,63 @@ and the conjunction of criteria across branches equals the original conjunction.
 unconstrained temporal windows `(a, b]` and `(b, c]` into `(a, c]` changes no endpoint anything refers to,
 and the merged window is itself unconstrained.
 
+### Look-back windows, and the strict versus universal forms
+
 Windows defined backward from a later endpoint (`start: end - 1d`, `end: week.end`) are kept whenever they
-are *guaranteeably* still in the future: the guaranteed elapsed time along the path (the sum of the temporal
-windows on it; event-bounded windows guarantee nothing, since the event may occur immediately) must cover
-the look-back. Such a window is rewritten as a forward chain from the rewound position, and its descendants
-continue from there. A look-back that could reach before the prediction time, or that crosses an
-event-bounded window, is an error.
+are *guaranteeably* still in the future. When the temporal windows since the last event-bounded endpoint
+cover the look-back, the window is rewritten as a forward chain from the rewound position, and its
+descendants continue from there. That keeps every window start-rooted, which is the **strict** form
+(`normalize(cfg)`), but it is not universal: a look-back from an event-bounded endpoint (the day before the
+next discharge) is provably in the future when enough temporal time precedes the event, yet no forward chain
+from the prediction time can reach "one day before the discharge".
+
+The **universal** form (`normalize(cfg, allow_end_rooted=True)`) keeps such a window end-rooted, with its
+`end` referencing the chain and its `start` defined backward from it, but only when a forward rewrite is
+impossible and the look-back is guaranteed not to reach before the prediction time:
+
+- `start: end - d` needs the end to be guaranteed at least `d` after the prediction time, where guarantees
+    come from the temporal windows on the path (an event-bounded hop guarantees nothing, since the event may
+    occur immediately);
+- `start: end <- P` needs `P` to be guaranteed to occur between the prediction time and the end, either
+    because the path hopped to the next `P` or because a criterion on the path requires at least one `P`.
+
+Guarantees propagate through such windows (a window hanging off `last_day.start` inherits the buffer), and
+are tracked symbolically since positions after an event-bounded hop are data-dependent
+(`aces_relaxations.guarantees`). Every other property is unchanged: criteria sit only on a branch's last
+window, the label branch is unconstrained, temporal runs collapse, prefixes share. A look-back that could
+reach before the prediction time is an error in both forms; the future-only check (`is_future_only`) uses
+the same guarantees, so the universal form succeeds on every future-only configuration whose windows after
+the prediction time are themselves guaranteeably future-only.
+
+```pycon
+>>> stay_cfg = TaskExtractorConfig(
+...     predicates={
+...         "admission": PlainPredicateConfig("ADMISSION"),
+...         "discharge": PlainPredicateConfig("DISCHARGE"),
+...         "lab": PlainPredicateConfig("LAB"),
+...     },
+...     trigger=EventConfig("admission"),
+...     windows={
+...         "input": WindowConfig("trigger", "start + 1d", False, True, index_timestamp="end"),
+...         "wait": WindowConfig("input.end", "start + 5d", False, True),
+...         "stay": WindowConfig("wait.end", "start -> discharge", False, True),
+...         "last_day": WindowConfig("end - 1d", "stay.end", False, True, has={"lab": "(1, None)"}),
+...         "target": WindowConfig("stay.end", "start + 30d", False, True, label="admission"),
+...     },
+... )
+>>> normalize(stay_cfg)
+Traceback (most recent call last):
+    ...
+ValueError: Window 'last_day' looks back 1 day across the event-bounded window 'stay', so it cannot be
+written as a start-rooted chain.
+>>> print_ACES(normalize(stay_cfg, allow_end_rooted=True))
+trigger; **Prediction Time**
+└── (+5 days, 0:00:00) wait.end
+    └── (next discharge) stay.end
+        ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
+        └── (-1 day, 0:00:00) last_day.start (at least 1 lab)
+
+```
 
 Two things are *not* preserved, by design. Cohort selection before the prediction time is gone, so the
 normalized configuration can only be compared on rows the original produces. And a branch that *starts* by
@@ -227,7 +278,8 @@ True
 Anchoring is done in the predicate table rather than by adding events to the data, so that an anchor at a
 time with no real event does not count towards `_ANY_EVENT` criteria. A second property test draws
 *arbitrary* ACES configurations (any reference, direction, bound type, record boundary, or index / label
-placement) and requires `normalize` to either raise or match ACES exactly.
+placement) and requires either form of `normalize` to raise or match ACES exactly; a third checks that the
+strict form is a special case of the universal one and that both imply the future-only property.
 
 The future-only property itself is checked empirically too (`tests/test_future_only_property.py`): on
 fixed random populations, a configuration judged guaranteeably future-only never realizes a label window
