@@ -18,7 +18,7 @@ from aces.config import (
     WindowConfig,
 )
 
-from aces_relaxations import print_ACES
+from aces_relaxations import RelaxedTaskConfig, print_ACES, strip_to_relevant_windows
 
 
 def _hospital_predicates() -> dict[str, PlainPredicateConfig | DerivedPredicateConfig]:
@@ -208,6 +208,9 @@ def _setup_doctest_namespace(
             "tempfile": tempfile,
             "Path": Path,
             "print_ACES": print_ACES,
+            "strip_to_relevant_windows": strip_to_relevant_windows,
+            "RelaxedTaskConfig": RelaxedTaskConfig,
+            "WindowConfig": WindowConfig,
             "sample_ACES_cfg": sample_ACES_cfg,
             "in_hosp_mortality_cfg": in_hosp_mortality_cfg,
             "post_discharge_mortality_cfg": post_discharge_mortality_cfg,
