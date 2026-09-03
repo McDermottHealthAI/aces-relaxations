@@ -85,6 +85,7 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
 "test_*" = ["DTZ001"]  # Ignore datetimez in test files
+"conftest.py" = ["DTZ001"]  # Naive datetimes are correct for MEDS test data
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "*ACES*", "*NRT*", "D", "L"] # "D" is used for distributions/datasets
