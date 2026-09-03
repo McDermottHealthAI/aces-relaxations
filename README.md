@@ -123,6 +123,103 @@ The check is conservative: it never accepts a config that could look into the pa
 configs that are future-only only by arithmetic (e.g. `end - 1d` where the end is one day after the
 prediction time).
 
+## Normalized form
+
+Relaxations change what a task means. Before changing anything, it helps to have a canonical way of writing
+a future-only task that *does not* change its meaning but separates the two things every downstream
+converter needs separately: the **target** (the chain of windows leading to the label window) and the
+**conditions** (inclusion / exclusion criteria, and event-bounded windows that must be realizable). That is
+the *normalized form*, produced by `normalize`:
+
+1. The tree is re-rooted at the prediction time. Everything before it (the trigger, the input window's
+    criteria, look-back windows) selects the cohort but cannot change the label of a row in it, so it is
+    discarded. Branches that start by moving backward from the prediction time are discarded with a warning.
+2. Every window carrying criteria is pulled out into its own **branch**: unconstrained copies of the windows
+    leading to it, then the constrained window. The label window's branch carries no criteria at all, and
+    unconstrained event-bounded leaf windows stay as branches because ACES drops rows whose event-bounded
+    windows cannot be realized.
+3. Along each branch, runs of unconstrained, unlabeled, temporal windows collapse into one window.
+4. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
+    every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
+
+The result is a genuine ACES configuration, triggered by a synthetic `index_event` predicate that marks the
+prediction time.
+
+```pycon
+>>> from aces_relaxations import normalize
+>>> normalized = normalize(post_discharge_mortality_cfg)
+>>> print_ACES(normalized)
+trigger; **Prediction Time**
+├── (next discharge) hospitalization.end
+│   ├── (+1 day, 0:00:00) gap.end
+│   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
+│   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
+└── (next discharge) hospitalization_criteria.end (no death)
+>>> print(normalized.label_branch)
+hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
+>>> for branch in normalized.criteria_branches:
+...     print(branch)
+post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
+hospitalization: start -> discharge (death: (None, 0))
+hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
+
+```
+
+Compare the original: the `hospitalization` and `gap` windows each carried criteria *and* led to the label.
+
+```pycon
+>>> print_ACES(post_discharge_mortality_cfg)
+trigger
+├── (start of record) sufficient_history.start (at least 5 event(s))
+└── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
+    ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
+    └── (next discharge) hospitalization.end (no death)
+        └── (+1 day, 0:00:00) gap.end (no admission, death)
+            └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
+
+```
+
+### Why it preserves labels
+
+With every edge after the prediction time moving forward in time, the timestamp of every window endpoint is
+a deterministic function of the data and the prediction time, computed along its path from the root. Copying
+a path realizes exactly the same endpoints, so a criterion evaluated on the copy has the same truth value,
+and the conjunction of criteria across branches equals the original conjunction. Merging two adjacent
+unconstrained temporal windows `(a, b]` and `(b, c]` into `(a, c]` changes no endpoint anything refers to,
+and the merged window is itself unconstrained.
+
+Two things are *not* preserved, by design. Cohort selection before the prediction time is gone, so the
+normalized configuration can only be compared on rows the original produces. And a criterion whose window
+starts before the prediction time but extends past it (a look-back window with a forward end) is discarded
+with the rest of the pre-prediction-time structure, even though it touches future data.
+
+This is checked against ACES itself: `tests/test_normalize_property.py` generates random future-only
+configurations and random MEDS data with [hypothesis](https://hypothesis.readthedocs.io/), extracts labels
+with the original configuration, then extracts with the normalized configuration anchored at those rows
+(`aces_relaxations.extraction.extract_at`), and requires the two results to be identical.
+
+```pycon
+>>> from aces_relaxations import extract, extract_at
+>>> original = extract(sample_ACES_cfg, sample_MEDS_df)
+>>> original
+shape: (2, 3)
+┌────────────┬─────────────────────┬───────────────┐
+│ subject_id ┆ prediction_time     ┆ boolean_value │
+│ ---        ┆ ---                 ┆ ---           │
+│ i64        ┆ datetime[μs]        ┆ bool          │
+╞════════════╪═════════════════════╪═══════════════╡
+│ 1          ┆ 2020-01-02 00:00:00 ┆ false         │
+│ 2          ┆ 2020-01-02 00:00:00 ┆ true          │
+└────────────┴─────────────────────┴───────────────┘
+>>> extract_at(normalize(sample_ACES_cfg), sample_MEDS_df, original).equals(original)
+True
+
+```
+
+Anchoring is done in the predicate table rather than by adding events to the data, so that an anchor at a
+time with no real event does not count towards `_ANY_EVENT` criteria.
+
 ## Supported Config Relaxations
 
 We support a few different relaxations that can help make reduced-language label extraction simpler and
