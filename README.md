@@ -723,16 +723,141 @@ efficiency.
 
 This makes no difference as there are no post-label windows in this example.
 
+#### 5. `assume_independent_codes`: Drop everything that cannot matter if codes are independent
+
+Time-to-event models such as MOTOR predict, for each code, the distribution of the time until that code next
+occurs, independently of every other code. Under that assumption, a criterion over codes unrelated to the
+label cannot change the label's distribution, and a window after the label is irrelevant. This relaxation
+therefore:
+
+1. drops every criterion whose predicate shares no plain predicate with the label predicate (including
+    `_ANY_EVENT` criteria),
+2. narrows "never" criteria on disjunctions to the label-related plain predicates (`no discharge_or_death`
+    becomes `no death` when the label is `death`) and keeps other label-related criteria unchanged, and
+3. removes all post-label windows.
+
+What remains are exactly the criteria such a model *can* honor, because they condition the very
+time-to-event distribution being queried.
+
+##### On Example 1: In Hospital Mortality
+
+```pycon
+>>> print_ACES(relax(in_hosp_mortality_cfg, {"assume_independent_codes": True}))
+input.end; **Prediction Time**
+└── (+1 day, 0:00:00) gap.end (no death)
+    └── (next discharge_or_death) target.end; **Label: Presence of death**
+
+```
+
+##### On Example 2: Post-discharge Mortality
+
+```pycon
+>>> print_ACES(relax(post_discharge_mortality_cfg, {"assume_independent_codes": True}))
+input.end; **Prediction Time**
+└── (next discharge) hospitalization.end (no death)
+    └── (+1 day, 0:00:00) gap.end (no death)
+        └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
+
+```
+
+##### On Example 3: Readmission
+
+The censoring-protection window and the `no death` criterion go; `no admission` stays because `admission` is
+the label:
+
+```pycon
+>>> print_ACES(relax(readmission_cfg, {"assume_independent_codes": True}))
+hospitalization.end; **Prediction Time**
+└── (+1 day, 0:00:00) gap.end (no admission)
+    └── (+29 days, 0:00:00) target.end; **Label: Presence of admission**
+
+```
+
+##### On Example 4: 2nd infusion stage adverse event
+
+The `no adverse_event` criterion is on the label predicate itself, so it stays:
+
+```pycon
+>>> print_ACES(relax(two_stage_cfg, {"assume_independent_codes": True}))
+1st_infusion.start; **Prediction Time**
+└── (next infusion_end) 1st_infusion.end (no adverse_event)
+    └── (next infusion_start) 2nd_infusion.start
+        └── (next infusion_end) 2nd_infusion.end; **Label: Presence of adverse_event**
+
+```
+
+##### On Example 5: Counted criteria
+
+Both counted criteria are unrelated to the label and vanish. The `no death` criterion stays, so the monitoring
+window is still a constrained gap and does not collapse into the target:
+
+```pycon
+>>> print_ACES(relax(counted_cfg, {"assume_independent_codes": True, "collapse_temporal_gap_windows": True}))
+input.end; **Prediction Time**
+└── (+6 days, 0:00:00) monitoring.end (no death)
+    └── (+23 days, 0:00:00) target.end; **Label: Presence of death**
+
+```
+
+#### 6. `restrict_to_vocabulary`: Rewrite predicates over a model's code vocabulary
+
+Tokenized and time-to-event models can only reason about a fixed set of codes. This relaxation rewrites each
+plain predicate into the vocabulary codes it matches (an exact code, an unanchored regex, or an `any` list),
+drops value constraints such models cannot express (a weakening), and replaces predicates that match nothing
+according to the `unmatched` policy: the default `"marginal"` substitutes the sentinel code `_MARGINAL_`,
+which a converter can interpret as "behaves like the average expressible code"; `"keep"` leaves them alone;
+`"error"` raises.
+
+```pycon
+>>> vocabulary = ["ADMISSION", "ICU_TRANSFER", "LAB//A1C", "LAB//GLUCOSE", "MEDS_DEATH"]
+>>> cfg = relax(counted_cfg, {"restrict_to_vocabulary": {"vocabulary": vocabulary}})
+>>> for name, pred in cfg.plain_predicates.items():
+...     print(f"{name}: {pred.code}")
+admission: ADMISSION
+lab: {'any': ['LAB//A1C', 'LAB//GLUCOSE']}
+icu_transfer: ICU_TRANSFER
+death: MEDS_DEATH
+>>> cfg = relax(counted_cfg, {"restrict_to_vocabulary": {"vocabulary": ["ADMISSION"]}})
+>>> for name, pred in cfg.plain_predicates.items():
+...     print(f"{name}: {pred.code}")
+admission: ADMISSION
+lab: _MARGINAL_
+icu_transfer: _MARGINAL_
+death: _MARGINAL_
+>>> relax(counted_cfg, {"restrict_to_vocabulary": {"vocabulary": ["ADMISSION"], "unmatched": "error"}})
+Traceback (most recent call last):
+    ...
+ValueError: Predicates match no vocabulary code: ['lab', 'icu_transfer', 'death'].
+
+```
+
+The helper `vocabulary_matches` reports the matches without modifying anything:
+
+```pycon
+>>> from aces_relaxations import vocabulary_matches
+>>> vocabulary_matches(counted_cfg, vocabulary)
+{'admission': ['ADMISSION'], 'lab': ['LAB//A1C', 'LAB//GLUCOSE'], 'icu_transfer': ['ICU_TRANSFER'],
+ 'death': ['MEDS_DEATH']}
+
+```
+
 ### Order of application and extension
 
 `relax` applies relaxations in the fixed order of the `RELAXATIONS` registry, regardless of the order in the
-mapping you pass: constraint-modifying relaxations (`remove_all_criteria`, `simplify_constraints`) run before
-structural ones (`collapse_temporal_gap_windows`, `remove_post_label_windows`).
+mapping you pass: predicate-level relaxations (`restrict_to_vocabulary`) run first, then criteria-level ones
+(`remove_all_criteria`, `assume_independent_codes`, `simplify_constraints`), then structural ones
+(`collapse_temporal_gap_windows`, `remove_post_label_windows`).
 
 ```pycon
 >>> from aces_relaxations import RELAXATIONS
->>> list(RELAXATIONS)
-['remove_all_criteria', 'simplify_constraints', 'collapse_temporal_gap_windows', 'remove_post_label_windows']
+>>> for name in RELAXATIONS:
+...     print(name)
+restrict_to_vocabulary
+remove_all_criteria
+assume_independent_codes
+simplify_constraints
+collapse_temporal_gap_windows
+remove_post_label_windows
 
 ```
 
@@ -769,7 +894,8 @@ labeling remain in `MEDS_trajectory_evaluation`.
 
 Relaxations planned for reduced query languages used by other foundation models:
 
-- Mapping predicates over codes absent from a tokenized model vocabulary onto approximate tokenized forms.
+- Mapping predicates over codes absent from a model vocabulary onto *nearby* in-vocabulary codes (e.g. via
+    a code hierarchy) rather than the marginal sentinel.
 - Mapping value-based predicates onto code-set predicates given quantized values joined with codes.
 - Simplifying complex multi-window queries into single-window approximations.
 
