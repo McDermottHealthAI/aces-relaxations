@@ -20,6 +20,7 @@ from aces.config import (
 )
 
 from aces_relaxations import RelaxedTaskConfig, print_ACES, strip_to_relevant_windows
+from aces_relaxations.extraction import extract
 
 
 def _hospital_predicates() -> dict[str, PlainPredicateConfig | DerivedPredicateConfig]:
@@ -229,6 +230,7 @@ def _setup_doctest_namespace(
             "tempfile": tempfile,
             "Path": Path,
             "print_ACES": print_ACES,
+            "extract": extract,
             "strip_to_relevant_windows": strip_to_relevant_windows,
             "RelaxedTaskConfig": RelaxedTaskConfig,
             "WindowConfig": WindowConfig,

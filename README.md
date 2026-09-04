@@ -131,15 +131,18 @@ converter needs separately: the **target** (the chain of windows leading to the 
 **conditions** (inclusion / exclusion criteria, and event-bounded windows that must be realizable). That is
 the *normalized form*, produced by `normalize`:
 
-1. The tree is re-rooted at the prediction time. Everything before it (the trigger, the input window's
+1. Every event-bounded window is given an explicit criterion that its bounding event occurs
+    (`require_bounding_events`, below), so nothing downstream has to know that ACES drops rows whose
+    event-bounded windows cannot be realized.
+2. The tree is re-rooted at the prediction time. Everything before it (the trigger, the input window's
     criteria, look-back windows) selects the cohort but cannot change the label of a row in it, so it is
     discarded. Branches that start by moving backward from the prediction time are discarded with a warning.
-2. Every window carrying criteria is pulled out into its own **branch**: unconstrained copies of the windows
+3. Every window carrying criteria is pulled out into its own **branch**: unconstrained copies of the windows
     leading to it, then the constrained window. The label window's branch carries no criteria at all, and
     unconstrained event-bounded leaf windows stay as branches because ACES drops rows whose event-bounded
     windows cannot be realized.
-3. Along each branch, runs of unconstrained, unlabeled, temporal windows collapse into one window.
-4. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
+4. Along each branch, runs of unconstrained, unlabeled, temporal windows collapse into one window.
+5. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
     every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
 
 The result is a genuine ACES configuration, triggered by a synthetic `index_event` predicate that marks the
@@ -153,7 +156,8 @@ trigger; **Prediction Time**
 ├── (next discharge) hospitalization.end
 │   ├── (+1 day, 0:00:00) gap.end
 │   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-│   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+│   ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+│   └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
 └── (next discharge) hospitalization_criteria.end (no death)
 >>> print(normalized.label_branch)
@@ -163,6 +167,8 @@ hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 
 post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
 hospitalization: start -> discharge (death: (None, 0))
 hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
+hospitalization: start -> discharge -> hospitalization_bounding_event: start -> discharge (discharge: (1,
+None))
 
 ```
 
@@ -188,6 +194,37 @@ a path realizes exactly the same endpoints, so a criterion evaluated on the copy
 and the conjunction of criteria across branches equals the original conjunction. Merging two adjacent
 unconstrained temporal windows `(a, b]` and `(b, c]` into `(a, c]` changes no endpoint anything refers to,
 and the merged window is itself unconstrained.
+
+### Making bounding events explicit
+
+`start -> discharge` only exists if a discharge occurs after the start. ACES enforces that implicitly by
+dropping rows whose event-bounded windows cannot be realized; another interpreter could just as reasonably
+read the window as extending to infinity when no discharge occurs. `require_bounding_events` removes the
+ambiguity by stating the requirement as an ordinary criterion, and works on any ACES configuration:
+
+- if both endpoints are inclusive, the bounding event is always counted by the window, which gets
+    `P: (1, None)` itself;
+- otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
+    not when the window is zero-length with an exclusive other endpoint (`[t, t)` is empty), which happens
+    whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window
+    anchored at the bounding event (`start: x.end`, `end: start -> P`, both endpoints inclusive) carries
+    the criterion. ACES resolves it to the bounding event itself, so it always holds when `x` is
+    realizable; under infinity semantics it fails exactly when `P` never occurs.
+
+It never adds a criterion that is already implied, so it is idempotent, and it is a no-op for ACES, which
+a property test checks on arbitrary configurations. Both normalized forms apply it first.
+
+```pycon
+>>> from aces_relaxations import require_bounding_events
+>>> print_ACES(require_bounding_events(in_hosp_mortality_cfg))
+trigger
+├── (start of record) sufficient_history.start (at least 5 event(s))
+└── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
+    └── (+1 day, 0:00:00) gap.end (no admission, discharge_or_death)
+        └── (next discharge_or_death) target.end; **Label: Presence of death**
+            └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+
+```
 
 ### Look-back windows, and the strict versus universal forms
 
@@ -243,7 +280,8 @@ trigger; **Prediction Time**
 └── (+5 days, 0:00:00) wait.end
     └── (next discharge) stay.end
         ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
-        └── (-1 day, 0:00:00) last_day.start (at least 1 lab)
+        ├── (-1 day, 0:00:00) last_day.start (at least 1 lab)
+        └── (next discharge) stay_bounding_event.end (at least 1 discharge)
 
 ```
 
