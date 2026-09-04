@@ -1083,6 +1083,39 @@ input.end; **Prediction Time**
 
 ```
 
+## Model-agnostic reductions
+
+Beyond named relaxations, `aces_relaxations.reductions` holds the two structural moves every
+reduced-query-language converter shares, operating on the normalized form:
+
+- **`label_only(normalized)`** keeps the label branch alone, dropping every condition branch. This is
+  the *conditional independence* assumption: criteria (and event-bounded realizability requirements)
+  are taken not to change the label's distribution. It is provably violated when a dropped criterion
+  shares plain-predicate codes with the label (e.g. a gap window forbidding the label code, or an
+  inclusion criterion requiring it) — converters should surface the dropped branches so such tasks can
+  be recognized.
+- **`last_link_target(normalized)`** reduces the label branch to its last window, re-rooted at that
+  window's own start. This is the *TTE stationarity* assumption: the model's prediction at the
+  prediction time stands in for the prediction it would make at the label window's true start. The
+  label window keeps its own extent; the discarded intermediate windows' time is gone. The result is a
+  `TargetWindow`: a fixed-duration, event-bounded, or to-record-end window over the label predicate,
+  with a `note` recording any approximation made in re-rooting a look-back window.
+
+```pycon
+>>> from aces_relaxations import label_only, last_link_target
+>>> print(label_only(normalize(post_discharge_mortality_cfg)))
+hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
+>>> last_link_target(normalize(post_discharge_mortality_cfg)).describe()
+'death within 29.0 days of the window start (start exclusive, end inclusive)'
+>>> last_link_target(normalize(in_hosp_mortality_cfg)).describe()
+'death before the next or(discharge, death) after the window start (start exclusive, end inclusive)'
+
+```
+
+Model-specific interpretation of the `TargetWindow` (e.g. MOTOR's hazard compositions, marginal
+sentinels for out-of-vocabulary predicates, and the treatment of never-occurring bounding events)
+lives in the converter packages (`a downstream converter` and siblings), typically in their decode step.
+
 ## Migrating from `MEDS_trajectory_evaluation`
 
 | `MEDS_trajectory_evaluation`                              | `aces_relaxations`                            |
