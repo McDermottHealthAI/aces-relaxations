@@ -11,11 +11,15 @@ Where the criterion goes depends on whether the bounding event is certainly coun
   window gets the criterion ``P: (1, None)`` directly (merged with any existing constraint on ``P``).
 - Otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
   not when the window is zero-length with an exclusive other endpoint (``[t, t)`` is empty), which happens
-  whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window is
-  anchored at the bounding event: ``start: x.end``, ``end: start -> P``, both endpoints inclusive, with
-  ``P: (1, None)``. ACES resolves ``start -> P`` with an inclusive end to the start event itself when that
-  event is a ``P``, so the window is ``[x.end, x.end]`` and its criterion always holds when ``x`` is
-  realizable; under infinity semantics it fails exactly when ``P`` never occurs.
+  whenever the bounding event coincides with the other endpoint. Then an auxiliary window is anchored at
+  the window's *other* endpoint — the same anchor the original search runs from — repeating the search
+  with the bounding endpoint made inclusive: for ``end: start -> P``, the auxiliary window is
+  ``start: <x's start>`` (same reference, same inclusivity), ``end: start -> P``, end inclusive, with
+  ``P: (1, None)``. It resolves to the same bounding event the original window resolves to and counts it,
+  so the criterion holds exactly when ``x`` is realizable — and, unlike a window anchored at the (possibly
+  unrealized) bounding endpoint itself, it needs no interpretation of searches launched from an unrealized
+  position: under infinity semantics the window simply runs to infinity containing no ``P``, and the
+  criterion fails.
 
 Either way the transformation is a no-op for ACES, which the property tests check on arbitrary
 configurations, and it is idempotent.
@@ -29,10 +33,12 @@ RECORD_BOUNDARIES = ("_RECORD_START", "_RECORD_END")
 AUXILIARY_SUFFIX = "_bounding_event"
 
 
-def _boundings(window: WindowConfig) -> list[tuple[str, str, bool]]:
-    """Each event bound of a window: its predicate, the bounded side, and whether that side is inclusive.
+def _boundings(window: WindowConfig) -> list[tuple[str, str, bool, str]]:
+    """Each event bound of a window: predicate, bounded side, that side's inclusivity, and the anchor.
 
-    A window can be event-bounded on both sides (``start: a.end -> admission``, ``end: start -> discharge``).
+    The anchor is the reference the bound's search runs from: ``"start"`` / ``"end"`` for an internal
+    reference (the window's other side), or the referenced node otherwise (``"trigger"``, ``"w.end"``). A
+    window can be event-bounded on both sides (``start: a.end -> admission``, ``end: start -> discharge``).
     """
     out = []
     for side, parsed in (("start", window._parsed_start), ("end", window._parsed_end)):
@@ -40,7 +46,7 @@ def _boundings(window: WindowConfig) -> list[tuple[str, str, bool]]:
         if not event or event.lstrip("-") in RECORD_BOUNDARIES:
             continue
         inclusive = window.start_inclusive if side == "start" else window.end_inclusive
-        out.append((event.lstrip("-"), side, inclusive))
+        out.append((event.lstrip("-"), side, inclusive, parsed["referenced"]))
     return out
 
 
@@ -60,8 +66,9 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
 
     Returns:
         A new configuration in which every window bounded by ``start -> P`` or ``end <- P`` either carries
-        ``P: (1, None)`` itself (both endpoints inclusive) or is accompanied by a zero-length auxiliary
-        window ``<name>_bounding_event`` anchored at the bounding event that carries it.
+        ``P: (1, None)`` itself (both endpoints inclusive) or is accompanied by an auxiliary window
+        ``<name>_bounding_event`` — a sibling repeating the same search from the same anchor with the
+        bounding endpoint inclusive — that carries it.
 
     Examples:
         >>> print_ACES(in_hosp_mortality_cfg)
@@ -76,14 +83,15 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
         ├── (start of record) sufficient_history.start (at least 5 event(s))
         └── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
             └── (+1 day, 0:00:00) gap.end (no admission, discharge_or_death)
-                └── (next discharge_or_death) target.end; **Label: Presence of death**
-                    └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+                ├── (next discharge_or_death) target.end; **Label: Presence of death**
+                └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
         >>> require_bounding_events(explicit).windows == explicit.windows
         True
 
-    Here ``target`` has an exclusive start, so the criterion went on a zero-length auxiliary window anchored
-    at the bounding event; the same happens below (``sufficient_history`` above is bounded by the record
-    start, which is not an event). A window with both endpoints inclusive carries the criterion itself:
+    Here ``target`` has an exclusive start, so the criterion went on an auxiliary sibling window repeating
+    the same search from ``gap.end`` with an inclusive end; the look-back bound below keeps the zero-length
+    singleton anchored at the bounding event (``sufficient_history`` above is bounded by the record start,
+    which is not an event). A window with both endpoints inclusive carries the criterion itself:
 
         >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
         >>> cfg = TaskExtractorConfig(
@@ -99,13 +107,13 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
         >>> print_ACES(explicit)
         trigger
         └── (+1 day, 0:00:00) input.end; **Prediction Time**
-            └── (next B) until_b.end; **Label: Presence of A**
-                ├── (prior B) since_b.start (no A)
-                │   └── (next B) since_b_bounding_event.end (at least 1 B)
-                └── (next B) until_b_bounding_event.end (at least 1 B)
+            ├── (next B) until_b.end; **Label: Presence of A**
+            │   └── (prior B) since_b.start (no A)
+            │       └── (next B) since_b_bounding_event.end (at least 1 B)
+            └── (next B) until_b_bounding_event.end (at least 1 B)
         >>> w = explicit.windows["until_b_bounding_event"]
         >>> w.start, w.end, w.start_inclusive, w.end_inclusive
-        ('until_b.end', 'start -> B', True, True)
+        ('input.end', 'start -> B', True, True)
         >>> require_bounding_events(explicit).windows == explicit.windows
         True
         >>> both = TaskExtractorConfig(
@@ -130,7 +138,7 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
     windows: dict[str, WindowConfig] = copy.deepcopy(task_cfg.windows)
 
     for name, window in list(windows.items()):
-        for predicate, side, inclusive in _boundings(window):
+        for predicate, side, inclusive, referenced in _boundings(window):
             other_inclusive = window.end_inclusive if side == "start" else window.start_inclusive
             existing = window.has.get(predicate)
             compatible = existing is None or existing[1] is None or existing[1] >= 1
@@ -140,12 +148,39 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
                     window.has[predicate] = (lo, None if existing is None else existing[1])
                 continue
 
-            anchor = f"{name}.{side}"
+            # A forward (end-side) bound whose search anchor is a plain reference gets its auxiliary
+            # window anchored at that same reference — a sibling repeating the search with an inclusive
+            # end, so it resolves to the same bounding event and counts it, and reads correctly under
+            # infinity semantics (no bounding event: an infinite window containing no ``P``). Look-back
+            # bounds and hop-valued anchors keep the zero-length singleton anchored at the bounding
+            # event, whose counting behavior ACES pins down (see the module docstring).
+            if inclusive and _requires(window, predicate):
+                continue  # an inclusive bounding endpoint with a >=1 criterion already asserts existence
+            aux_args = None
+            if side == "end":
+                anchor_expr = window.start if referenced == "start" else referenced
+                plain = anchor_expr is not None and "->" not in anchor_expr and "<-" not in anchor_expr
+                if plain:
+                    # both endpoints inclusive: ACES resolves ``anchor -> P`` at-or-after the anchor, so
+                    # a bounding event coincident with the anchor must be counted ([t, t], not (t, t])
+                    aux_args = dict(
+                        start=anchor_expr,
+                        end=f"start -> {predicate}",
+                        start_inclusive=True,
+                        end_inclusive=True,
+                    )
+            if aux_args is None:
+                aux_args = dict(
+                    start=f"{name}.{side}",
+                    end=f"start -> {predicate}",
+                    start_inclusive=True,
+                    end_inclusive=True,
+                )
             already = any(
-                w.start == anchor
-                and w.end == f"start -> {predicate}"
-                and w.start_inclusive
-                and w.end_inclusive
+                w.start == aux_args["start"]
+                and w.end == aux_args["end"]
+                and w.start_inclusive == aux_args["start_inclusive"]
+                and w.end_inclusive == aux_args["end_inclusive"]
                 and _requires(w, predicate)
                 for w in windows.values()
             )
@@ -155,9 +190,7 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
             while aux_name in windows:
                 aux_name = f"{name}{AUXILIARY_SUFFIX}_{i}"
                 i += 1
-            windows[aux_name] = WindowConfig(
-                anchor, f"start -> {predicate}", True, True, has={predicate: "(1, None)"}
-            )
+            windows[aux_name] = WindowConfig(has={predicate: "(1, None)"}, **aux_args)
 
     return type(task_cfg)(
         predicates=copy.deepcopy(task_cfg.predicates),
