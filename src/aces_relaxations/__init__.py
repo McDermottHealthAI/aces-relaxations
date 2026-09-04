@@ -15,6 +15,7 @@ Key entry points:
   - [`print_ACES`][aces_relaxations.printing.print_ACES] -- a tree pretty-printer for configurations.
 """
 
+from .bounding_events import require_bounding_events
 from .constraint_simplification import (
     ConstraintSimplificationRules,
     ConstraintTarget,
@@ -76,6 +77,7 @@ __all__ = [
     "relax",
     "remove_all_criteria",
     "remove_post_label_windows",
+    "require_bounding_events",
     "resolve_node",
     "restrict_to_vocabulary",
     "simplify_constraints",

@@ -22,6 +22,7 @@ from aces.config import (
 from hypothesis import HealthCheck, assume, event, given, settings
 from hypothesis import strategies as st
 
+from aces_relaxations.bounding_events import require_bounding_events
 from aces_relaxations.extraction import extract, extract_at
 from aces_relaxations.future_only import is_future_only
 from aces_relaxations.normalization import normalize
@@ -293,3 +294,18 @@ def test_forms_are_consistent(task_cfg: TaskExtractorConfig):
         assert universal.branches == strict.branches
     if universal is not None:
         assert is_future_only(task_cfg)
+
+
+@SETTINGS
+@given(arbitrary_task_configs(), meds_data())
+def test_require_bounding_events_is_a_no_op_for_aces(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame):
+    """Making bounding events explicit is idempotent and changes no extracted row or label."""
+    explicit = require_bounding_events(task_cfg)
+    assert require_bounding_events(explicit).windows == explicit.windows
+
+    try:
+        original = extract(task_cfg, MEDS_df)
+    except Exception:
+        event("ACES failed on the original configuration")
+        return
+    assert extract(explicit, MEDS_df).equals(original)
