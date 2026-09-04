@@ -123,6 +123,215 @@ The check is conservative: it never accepts a config that could look into the pa
 configs that are future-only only by arithmetic (e.g. `end - 1d` where the end is one day after the
 prediction time).
 
+## Normalized form
+
+Relaxations change what a task means. Before changing anything, it helps to have a canonical way of writing
+a future-only task that *does not* change its meaning but separates the two things every downstream
+converter needs separately: the **target** (the chain of windows leading to the label window) and the
+**conditions** (inclusion / exclusion criteria, and event-bounded windows that must be realizable). That is
+the *normalized form*, produced by `normalize`:
+
+1. Every event-bounded window is given an explicit criterion that its bounding event occurs
+    (`require_bounding_events`, below), so nothing downstream has to know that ACES drops rows whose
+    event-bounded windows cannot be realized.
+2. The tree is re-rooted at the prediction time. Everything before it (the trigger, the input window's
+    criteria, look-back windows) selects the cohort but cannot change the label of a row in it, so it is
+    discarded. Branches that start by moving backward from the prediction time are discarded with a warning.
+3. Every window carrying criteria is pulled out into its own **branch**: unconstrained copies of the windows
+    leading to it, then the constrained window. The label window's branch carries no criteria at all, and
+    unconstrained event-bounded leaf windows stay as branches because ACES drops rows whose event-bounded
+    windows cannot be realized.
+4. Along each branch, runs of unconstrained, unlabeled, temporal windows collapse into one window.
+5. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
+    every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
+
+The result is a genuine ACES configuration, triggered by a synthetic `index_event` predicate that marks the
+prediction time.
+
+```pycon
+>>> from aces_relaxations import normalize
+>>> normalized = normalize(post_discharge_mortality_cfg)
+>>> print_ACES(normalized)
+trigger; **Prediction Time**
+├── (next discharge) hospitalization.end
+│   ├── (+1 day, 0:00:00) gap.end
+│   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
+│   ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+│   └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
+├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
+└── (next discharge) hospitalization_criteria.end (no death)
+>>> print(normalized.label_branch)
+hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
+>>> for branch in normalized.criteria_branches:
+...     print(branch)
+post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
+hospitalization: start -> discharge (death: (None, 0))
+hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
+hospitalization: start -> discharge -> hospitalization_bounding_event: start -> discharge (discharge: (1,
+None))
+
+```
+
+Compare the original: the `hospitalization` and `gap` windows each carried criteria *and* led to the label.
+
+```pycon
+>>> print_ACES(post_discharge_mortality_cfg)
+trigger
+├── (start of record) sufficient_history.start (at least 5 event(s))
+└── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
+    ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
+    └── (next discharge) hospitalization.end (no death)
+        └── (+1 day, 0:00:00) gap.end (no admission, death)
+            └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
+
+```
+
+### Why it preserves labels
+
+With every edge after the prediction time moving forward in time, the timestamp of every window endpoint is
+a deterministic function of the data and the prediction time, computed along its path from the root. Copying
+a path realizes exactly the same endpoints, so a criterion evaluated on the copy has the same truth value,
+and the conjunction of criteria across branches equals the original conjunction. Merging two adjacent
+unconstrained temporal windows `(a, b]` and `(b, c]` into `(a, c]` changes no endpoint anything refers to,
+and the merged window is itself unconstrained.
+
+### Making bounding events explicit
+
+`start -> discharge` only exists if a discharge occurs after the start. ACES enforces that implicitly by
+dropping rows whose event-bounded windows cannot be realized; another interpreter could just as reasonably
+read the window as extending to infinity when no discharge occurs. `require_bounding_events` removes the
+ambiguity by stating the requirement as an ordinary criterion, and works on any ACES configuration:
+
+- if both endpoints are inclusive, the bounding event is always counted by the window, which gets
+    `P: (1, None)` itself;
+- otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
+    not when the window is zero-length with an exclusive other endpoint (`[t, t)` is empty), which happens
+    whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window
+    anchored at the bounding event (`start: x.end`, `end: start -> P`, both endpoints inclusive) carries
+    the criterion. ACES resolves it to the bounding event itself, so it always holds when `x` is
+    realizable; under infinity semantics it fails exactly when `P` never occurs.
+
+It never adds a criterion that is already implied, so it is idempotent, and it is a no-op for ACES, which
+a property test checks on arbitrary configurations. Both normalized forms apply it first.
+
+```pycon
+>>> from aces_relaxations import require_bounding_events
+>>> print_ACES(require_bounding_events(in_hosp_mortality_cfg))
+trigger
+├── (start of record) sufficient_history.start (at least 5 event(s))
+└── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
+    └── (+1 day, 0:00:00) gap.end (no admission, discharge_or_death)
+        └── (next discharge_or_death) target.end; **Label: Presence of death**
+            └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+
+```
+
+### Look-back windows, and the strict versus universal forms
+
+Windows defined backward from a later endpoint (`start: end - 1d`, `end: week.end`) are kept whenever they
+are *guaranteeably* still in the future. When the temporal windows since the last event-bounded endpoint
+cover the look-back, the window is rewritten as a forward chain from the rewound position, and its
+descendants continue from there. That keeps every window start-rooted, which is the **strict** form
+(`normalize(cfg)`), but it is not universal: a look-back from an event-bounded endpoint (the day before the
+next discharge) is provably in the future when enough temporal time precedes the event, yet no forward chain
+from the prediction time can reach "one day before the discharge".
+
+The **universal** form (`normalize(cfg, allow_end_rooted=True)`) keeps such a window end-rooted, with its
+`end` referencing the chain and its `start` defined backward from it, but only when a forward rewrite is
+impossible and the look-back is guaranteed not to reach before the prediction time:
+
+- `start: end - d` needs the end to be guaranteed at least `d` after the prediction time, where guarantees
+    come from the temporal windows on the path (an event-bounded hop guarantees nothing, since the event may
+    occur immediately);
+- `start: end <- P` needs `P` to be guaranteed to occur between the prediction time and the end, either
+    because the path hopped to the next `P` or because a criterion on the path requires at least one `P`.
+
+Guarantees propagate through such windows (a window hanging off `last_day.start` inherits the buffer), and
+are tracked symbolically since positions after an event-bounded hop are data-dependent
+(`aces_relaxations.guarantees`). Every other property is unchanged: criteria sit only on a branch's last
+window, the label branch is unconstrained, temporal runs collapse, prefixes share. A look-back that could
+reach before the prediction time is an error in both forms; the future-only check (`is_future_only`) uses
+the same guarantees, so the universal form succeeds on every future-only configuration whose windows after
+the prediction time are themselves guaranteeably future-only.
+
+```pycon
+>>> stay_cfg = TaskExtractorConfig(
+...     predicates={
+...         "admission": PlainPredicateConfig("ADMISSION"),
+...         "discharge": PlainPredicateConfig("DISCHARGE"),
+...         "lab": PlainPredicateConfig("LAB"),
+...     },
+...     trigger=EventConfig("admission"),
+...     windows={
+...         "input": WindowConfig("trigger", "start + 1d", False, True, index_timestamp="end"),
+...         "wait": WindowConfig("input.end", "start + 5d", False, True),
+...         "stay": WindowConfig("wait.end", "start -> discharge", False, True),
+...         "last_day": WindowConfig("end - 1d", "stay.end", False, True, has={"lab": "(1, None)"}),
+...         "target": WindowConfig("stay.end", "start + 30d", False, True, label="admission"),
+...     },
+... )
+>>> normalize(stay_cfg)
+Traceback (most recent call last):
+    ...
+ValueError: Window 'last_day' looks back 1 day across the event-bounded window 'stay', so it cannot be
+written as a start-rooted chain.
+>>> print_ACES(normalize(stay_cfg, allow_end_rooted=True))
+trigger; **Prediction Time**
+└── (+5 days, 0:00:00) wait.end
+    └── (next discharge) stay.end
+        ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
+        ├── (-1 day, 0:00:00) last_day.start (at least 1 lab)
+        └── (next discharge) stay_bounding_event.end (at least 1 discharge)
+
+```
+
+Two things are *not* preserved, by design. Cohort selection before the prediction time is gone, so the
+normalized configuration can only be compared on rows the original produces. And a branch that *starts* by
+moving backward from the prediction time (a look-back window anchored at the prediction time itself) is
+discarded with the rest of the pre-prediction-time structure, with a warning.
+
+This is checked against ACES itself: `tests/test_normalize_property.py` generates random future-only
+configurations and random MEDS data with [hypothesis](https://hypothesis.readthedocs.io/), extracts labels
+with the original configuration, then extracts with the normalized configuration anchored at those rows
+(`aces_relaxations.extraction.extract_at`), and requires the two results to be identical.
+
+```pycon
+>>> from aces_relaxations import extract, extract_at
+>>> original = extract(sample_ACES_cfg, sample_MEDS_df)
+>>> original
+shape: (2, 3)
+┌────────────┬─────────────────────┬───────────────┐
+│ subject_id ┆ prediction_time     ┆ boolean_value │
+│ ---        ┆ ---                 ┆ ---           │
+│ i64        ┆ datetime[μs]        ┆ bool          │
+╞════════════╪═════════════════════╪═══════════════╡
+│ 1          ┆ 2020-01-02 00:00:00 ┆ false         │
+│ 2          ┆ 2020-01-02 00:00:00 ┆ true          │
+└────────────┴─────────────────────┴───────────────┘
+>>> extract_at(normalize(sample_ACES_cfg), sample_MEDS_df, original).equals(original)
+True
+
+```
+
+Anchoring is done in the predicate table rather than by adding events to the data, so that an anchor at a
+time with no real event does not count towards `_ANY_EVENT` criteria. A second property test draws
+*arbitrary* ACES configurations (any reference, direction, bound type, record boundary, or index / label
+placement) and requires either form of `normalize` to raise or match ACES exactly; a third checks that the
+strict form is a special case of the universal one and that both imply the future-only property.
+
+The future-only property itself is checked empirically too (`tests/test_future_only_property.py`): on
+fixed random populations, a configuration judged guaranteeably future-only never realizes a label window
+starting before its prediction time, and a criteria-free configuration whose label is reachable only
+through a path that can look back realizes one at least once. The data are deliberately moderately sparse
+so that "can look back" is a real possibility rather than a theoretical one.
+
+> [!NOTE]
+> The extraction helpers take the prediction time from the resolved window tree rather than from ACES's
+> `index_timestamp` column. ACES names the two timestamps in a node's summary by traversal direction rather
+> than by time, so for a window defined backward from its end (`start: end - 1d`, `end: trigger`) with
+> `index_timestamp: end`, its column reports the window's *start*. ACES also accumulates into each bound's
+> `offset` on every query, so configurations are deep-copied before querying.
+
 ## Supported Config Relaxations
 
 We support a few different relaxations that can help make reduced-language label extraction simpler and
