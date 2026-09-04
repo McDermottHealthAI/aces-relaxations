@@ -99,7 +99,9 @@ def _tidy(task_cfg: TaskExtractorConfig, result: pl.DataFrame) -> pl.DataFrame:
 
     Rows whose prediction time or label is null are dropped: ACES emits such rows when a window's end falls
     before its start (e.g. a window to the end of the record anchored after the last event), and they cannot
-    be prediction-task rows.
+    be prediction-task rows. The sort includes the label so that two triggers resolving to the same
+    prediction time with different labels (e.g. a prediction time at the record start) compare
+    deterministically.
     """
     schema = {SUBJECT_ID: pl.Int64, PREDICTION_TIME: pl.Datetime("us"), BOOLEAN_VALUE: pl.Boolean}
     if len(result) == 0 or "label" not in result.columns:
@@ -112,7 +114,7 @@ def _tidy(task_cfg: TaskExtractorConfig, result: pl.DataFrame) -> pl.DataFrame:
         )
         .drop_nulls()
         .unique()
-        .sort(SUBJECT_ID, PREDICTION_TIME)
+        .sort(SUBJECT_ID, PREDICTION_TIME, BOOLEAN_VALUE)
     )
     return tidy if len(tidy) else pl.DataFrame(schema=schema)
 
