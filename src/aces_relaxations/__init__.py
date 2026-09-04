@@ -34,6 +34,7 @@ from .independence import assume_independent_codes
 from .normalization import Branch, Edge, NormalizedTaskConfig, branches, normalize
 from .predicates import PredicateExpr, label_predicate_expr, leaf_predicates, predicate_expr
 from .printing import get_constraint_str, print_ACES
+from .reductions import TargetWindow, label_only, last_link_target
 from .registry import RELAXATIONS, relax
 from .relaxations import (
     collapse_temporal_gap_windows,
@@ -42,7 +43,13 @@ from .relaxations import (
     strip_to_relevant_windows,
 )
 from .tree import RelaxedTaskConfig, WindowNode, label_node, prediction_time_node, resolve_node
-from .vocabulary import MARGINAL_CODE, matching_codes, restrict_to_vocabulary, vocabulary_matches
+from .vocabulary import (
+    MARGINAL_CODE,
+    matching_codes,
+    quantized_value_codes,
+    restrict_to_vocabulary,
+    vocabulary_matches,
+)
 
 __all__ = [
     "MARGINAL_CODE",
@@ -54,6 +61,7 @@ __all__ = [
     "NormalizedTaskConfig",
     "PredicateExpr",
     "RelaxedTaskConfig",
+    "TargetWindow",
     "WindowNode",
     "assume_independent_codes",
     "branches",
@@ -67,13 +75,16 @@ __all__ = [
     "get_predicates",
     "is_future_only",
     "label_node",
+    "label_only",
     "label_predicate_expr",
+    "last_link_target",
     "leaf_predicates",
     "matching_codes",
     "normalize",
     "predicate_expr",
     "prediction_time_node",
     "print_ACES",
+    "quantized_value_codes",
     "relax",
     "remove_all_criteria",
     "remove_post_label_windows",
