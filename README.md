@@ -156,10 +156,10 @@ trigger; **Prediction Time**
 ├── (next discharge) hospitalization.end
 │   ├── (+1 day, 0:00:00) gap.end
 │   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-│   ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
-│   └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
+│   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
 ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
-└── (next discharge) hospitalization_criteria.end (no death)
+├── (next discharge) hospitalization_criteria.end (no death)
+└── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 >>> print(normalized.label_branch)
 hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
 >>> for branch in normalized.criteria_branches:
@@ -167,8 +167,7 @@ hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 
 post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
 hospitalization: start -> discharge (death: (None, 0))
 hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
-hospitalization: start -> discharge -> hospitalization_bounding_event: start -> discharge (discharge: (1,
-None))
+hospitalization_bounding_event: start -> discharge (discharge: (1, None))
 
 ```
 
@@ -207,9 +206,12 @@ ambiguity by stating the requirement as an ordinary criterion, and works on any 
 - otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
     not when the window is zero-length with an exclusive other endpoint (`[t, t)` is empty), which happens
     whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window
-    anchored at the bounding event (`start: x.end`, `end: start -> P`, both endpoints inclusive) carries
-    the criterion. ACES resolves it to the bounding event itself, so it always holds when `x` is
-    realizable; under infinity semantics it fails exactly when `P` never occurs.
+    carries the criterion. For a forward bound whose search anchor is a plain reference, the auxiliary
+    window is a *sibling* repeating the same search from the same anchor with an inclusive end, so it
+    resolves to the same bounding event and counts it — and under infinity semantics it reads directly as
+    an infinite window containing no `P`, failing the criterion. Look-back bounds and hop-valued anchors
+    keep a zero-length singleton anchored at the bounding event itself, whose counting behavior ACES pins
+    down.
 
 It never adds a criterion that is already implied, so it is idempotent, and it is a no-op for ACES, which
 a property test checks on arbitrary configurations. Both normalized forms apply it first.
@@ -221,8 +223,8 @@ trigger
 ├── (start of record) sufficient_history.start (at least 5 event(s))
 └── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
     └── (+1 day, 0:00:00) gap.end (no admission, discharge_or_death)
-        └── (next discharge_or_death) target.end; **Label: Presence of death**
-            └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+        ├── (next discharge_or_death) target.end; **Label: Presence of death**
+        └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
 
 ```
 
@@ -278,10 +280,10 @@ written as a start-rooted chain.
 >>> print_ACES(normalize(stay_cfg, allow_end_rooted=True))
 trigger; **Prediction Time**
 └── (+5 days, 0:00:00) wait.end
-    └── (next discharge) stay.end
-        ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
-        ├── (-1 day, 0:00:00) last_day.start (at least 1 lab)
-        └── (next discharge) stay_bounding_event.end (at least 1 discharge)
+    ├── (next discharge) stay.end
+    │   ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
+    │   └── (-1 day, 0:00:00) last_day.start (at least 1 lab)
+    └── (next discharge) stay_bounding_event.end (at least 1 discharge)
 
 ```
 

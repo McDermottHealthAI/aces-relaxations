@@ -550,15 +550,13 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
         >>> for b in branches(in_hosp_mortality_cfg): print(b)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         gap: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
-        gap: start + 1 day -> target: start -> discharge_or_death; label=death -> target_bounding_event:
-        start -> discharge_or_death (discharge_or_death: (1, None))
+        gap: start + 1 day -> target_bounding_event: start -> discharge_or_death (discharge_or_death: (1, None))
         >>> for b in branches(post_discharge_mortality_cfg): print(b)
         hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
         post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
         hospitalization: start -> discharge (death: (None, 0))
         hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
-        hospitalization: start -> discharge -> hospitalization_bounding_event: start -> discharge
-        (discharge: (1, None))
+        hospitalization_bounding_event: start -> discharge (discharge: (1, None))
         >>> for b in branches(readmission_cfg): print(b)
         gap: start + 1 day -> target: start + 29 days; label=admission
         gap: start + 1 day (admission: (None, 0), death: (None, 0))
@@ -615,8 +613,8 @@ def normalize(
         >>> print_ACES(normalized)
         trigger; **Prediction Time**
         ├── (+1 day, 0:00:00) gap.end
-        │   └── (next discharge_or_death) target.end; **Label: Presence of death**
-        │       └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+        │   ├── (next discharge_or_death) target.end; **Label: Presence of death**
+        │   └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
         └── (+1 day, 0:00:00) gap_criteria.end (no admission, discharge_or_death)
         >>> print(normalized.label_branch)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
@@ -632,10 +630,10 @@ def normalize(
         ├── (next discharge) hospitalization.end
         │   ├── (+1 day, 0:00:00) gap.end
         │   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-        │   ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
-        │   └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
+        │   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
         ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
-        └── (next discharge) hospitalization_criteria.end (no death)
+        ├── (next discharge) hospitalization_criteria.end (no death)
+        └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 
     Unconstrained temporal windows collapse; the label window and constrained windows never do:
 
@@ -655,9 +653,8 @@ def normalize(
         trigger; **Prediction Time**
         └── (+10 days, 0:00:00) gap1__gap2.end
             ├── (+5 days, 0:00:00) target.end; **Label: Presence of B**
-            ├── (next B) watch.end
-            │   └── (next B) watch_bounding_event.end (at least 1 B)
-            └── (next B) watch_criteria.end (no A)
+            ├── (next B) watch.end (no A)
+            └── (next B) watch_bounding_event.end (at least 1 B)
 
     Windows defined backward from a later endpoint are fine as long as they cannot reach before the
     prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
@@ -738,19 +735,18 @@ def normalize(
         >>> print_ACES(universal)
         trigger; **Prediction Time**
         ├── (+5 days, 0:00:00) wait.end
-        │   └── (next discharge) stay.end
-        │       ├── (+30 days, 0:00:00) target.end; **Label: Presence of A**
-        │       ├── (-1 day, 0:00:00) last_day.start (at least 1 A)
-        │       ├── (prior admission) since_admission.start (no A; at least 1 admission)
-        │       └── (next discharge) stay_bounding_event.end (at least 1 discharge)
+        │   ├── (next discharge) stay.end
+        │   │   ├── (+30 days, 0:00:00) target.end; **Label: Presence of A**
+        │   │   ├── (-1 day, 0:00:00) last_day.start (at least 1 A)
+        │   │   └── (prior admission) since_admission.start (no A; at least 1 admission)
+        │   └── (next discharge) stay_bounding_event.end (at least 1 discharge)
         └── (+5 days, 0:00:00) wait_criteria.end (at least 1 admission)
         >>> for b in universal.criteria_branches: print(b)
         wait: start + 5 days (admission: (1, None))
         wait: start + 5 days -> stay: start -> discharge -> last_day: end - 1 day (A: (1, None))
         wait: start + 5 days -> stay: start -> discharge -> since_admission: end <- admission (A: (None,
         0), admission: (1, None))
-        wait: start + 5 days -> stay: start -> discharge -> stay_bounding_event: start -> discharge
-        (discharge: (1, None))
+        wait: start + 5 days -> stay_bounding_event: start -> discharge (discharge: (1, None))
         >>> universal.windows["last_day"].start, universal.windows["last_day"].end
         ('end - 1 day', 'stay.end')
 
