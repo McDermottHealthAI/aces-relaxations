@@ -58,6 +58,82 @@ def matching_codes(predicate: PlainPredicateConfig, vocabulary: Iterable[str]) -
     return sorted(matches)
 
 
+VALUE_BIN = re.compile(r"^(?P<base>.*)//value_(?P<lo_br>[\[(])(?P<lo>[^,]+),(?P<hi>[^\])]+)(?P<hi_br>[\])])$")
+
+
+def _parse_bound(text: str) -> float:
+    text = text.strip().lower()
+    if text in ("inf", "+inf"):
+        return float("inf")
+    if text == "-inf":
+        return float("-inf")
+    return float(text)
+
+
+def quantized_value_codes(
+    predicate: PlainPredicateConfig,
+    vocabulary: Iterable[str],
+    partial: Literal["include", "exclude"] = "include",
+) -> list[str]:
+    r"""Returns the quantized value-bin codes a value-constrained plain predicate matches.
+
+    Everything-is-code tokenizations join a code with a bin of its numeric value into one code, named like
+    ``HR//value_[102.6,105.1)``. A predicate such as "``HR`` with value at least 100" then corresponds to the
+    set of ``HR`` bin codes whose interval lies in ``[100, inf)``.
+
+    Args:
+        predicate: A plain predicate with ``value_min`` and / or ``value_max``.
+        vocabulary: The codes the model can express.
+        partial: What to do with a bin that only partly overlaps the constraint's range: include it (a
+            weakening) or exclude it (a strengthening).
+
+    Returns:
+        The matching bin codes, sorted. A predicate without value constraints matches nothing here (use
+        ``matching_codes``).
+
+    Examples:
+        >>> vocab = [
+        ...     "HR//value_[-inf,60.0)", "HR//value_[60.0,100.0)", "HR//value_[100.0,120.0)",
+        ...     "HR//value_[120.0,inf)", "HR", "SBP//value_[90.0,140.0)",
+        ... ]
+        >>> quantized_value_codes(PlainPredicateConfig("HR", value_min=100), vocab)
+        ['HR//value_[100.0,120.0)', 'HR//value_[120.0,inf)']
+        >>> quantized_value_codes(PlainPredicateConfig("HR", value_min=110), vocab)
+        ['HR//value_[100.0,120.0)', 'HR//value_[120.0,inf)']
+        >>> quantized_value_codes(PlainPredicateConfig("HR", value_min=110), vocab, partial="exclude")
+        ['HR//value_[120.0,inf)']
+        >>> quantized_value_codes(PlainPredicateConfig("HR", value_max=60, value_max_inclusive=False), vocab)
+        ['HR//value_[-inf,60.0)']
+        >>> quantized_value_codes(PlainPredicateConfig(code={"regex": "^HR$"}, value_min=100), vocab)
+        ['HR//value_[100.0,120.0)', 'HR//value_[120.0,inf)']
+        >>> quantized_value_codes(PlainPredicateConfig("HR"), vocab)
+        []
+    """
+    if predicate.value_min is None and predicate.value_max is None:
+        return []
+
+    lo = float("-inf") if predicate.value_min is None else float(predicate.value_min)
+    hi = float("inf") if predicate.value_max is None else float(predicate.value_max)
+
+    bins: dict[str, list[tuple[str, float, float]]] = {}
+    for code in vocabulary:
+        m = VALUE_BIN.match(code)
+        if m:
+            bins.setdefault(m["base"], []).append((code, _parse_bound(m["lo"]), _parse_bound(m["hi"])))
+
+    base_predicate = PlainPredicateConfig(predicate.code)
+    bases = matching_codes(base_predicate, bins)
+
+    out = []
+    for base in bases:
+        for code, b_lo, b_hi in bins[base]:
+            inside = lo <= b_lo and b_hi <= hi
+            overlaps = b_lo < hi and lo < b_hi
+            if inside or (partial == "include" and overlaps):
+                out.append(code)
+    return sorted(out)
+
+
 def vocabulary_matches(task_cfg: TaskExtractorConfig, vocabulary: Iterable[str]) -> dict[str, list[str]]:
     """Returns, for each plain predicate, the vocabulary codes it matches.
 
@@ -75,6 +151,7 @@ def restrict_to_vocabulary(
     unmatched: UnmatchedPolicy = "marginal",
     marginal_code: str = MARGINAL_CODE,
     drop_value_constraints: bool = True,
+    quantized_values: bool = False,
 ) -> TaskExtractorConfig:
     r"""Rewrites every plain predicate into the vocabulary codes it matches.
 
@@ -90,6 +167,9 @@ def restrict_to_vocabulary(
         marginal_code: The sentinel code standing in for unmatched predicates.
         drop_value_constraints: Whether to drop ``value_min`` / ``value_max`` bounds (a weakening). If
             ``False``, predicates with value bounds raise.
+        quantized_values: Whether to resolve value-constrained predicates onto the vocabulary's quantized
+            value-bin codes (see ``quantized_value_codes``) instead of dropping the constraint. Such a
+            predicate then matches its bin codes and carries no value constraint.
 
     Returns:
         The modified configuration.
@@ -145,6 +225,14 @@ def restrict_to_vocabulary(
         Traceback (most recent call last):
             ...
         ValueError: Predicates have value constraints, which cannot be expressed: ['high_glucose'].
+
+    With ``quantized_values``, a value-constrained predicate becomes the value-bin codes it matches:
+
+        >>> binned = ["ADMISSION", "LAB//GLUCOSE//value_[0.0,200.0)", "LAB//GLUCOSE//value_[200.0,inf)"]
+        >>> cfg = restrict_to_vocabulary(make_cfg(), binned, quantized_values=True)
+        >>> cfg.plain_predicates["high_glucose"].code, cfg.plain_predicates["high_glucose"].value_min
+        ('LAB//GLUCOSE//value_[200.0,inf)', None)
+
         >>> restrict_to_vocabulary(make_cfg(), vocab, unmatched="sometimes")
         Traceback (most recent call last):
             ...
@@ -155,11 +243,16 @@ def restrict_to_vocabulary(
             f"Unknown unmatched policy '{unmatched}'; expected one of ['marginal', 'keep', 'error']."
         )
 
+    vocabulary = list(vocabulary)
     matches = vocabulary_matches(task_cfg, vocabulary)
 
     with_values = [
         n for n, p in task_cfg.plain_predicates.items() if p.value_min is not None or p.value_max is not None
     ]
+    if quantized_values:
+        for name in with_values:
+            matches[name] = quantized_value_codes(task_cfg.plain_predicates[name], vocabulary)
+        drop_value_constraints = True
     if with_values and not drop_value_constraints:
         raise ValueError(f"Predicates have value constraints, which cannot be expressed: {with_values}.")
 
