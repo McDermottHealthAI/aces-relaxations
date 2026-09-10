@@ -123,6 +123,53 @@ The check is conservative: it never accepts a config that could look into the pa
 configs that are future-only only by arithmetic (e.g. `end - 1d` where the end is one day after the
 prediction time).
 
+## Degenerate configurations
+
+A configuration can fix its own outcome before any data is seen: a criterion may guarantee an occurrence of
+the label predicate inside the label window (every label is `True`), forbid one over a window enclosing it
+(every label is `False`), or contradict another criterion (no row ever satisfies them all). `degeneracies`
+lists such findings, and `is_always_positive` / `is_always_negative` / `is_unsatisfiable` summarize them:
+
+```pycon
+>>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
+>>> from aces_relaxations import degeneracies
+>>> predicates = {"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")}
+>>> cfg = TaskExtractorConfig(
+...     predicates=predicates,
+...     trigger=EventConfig("A"),
+...     windows={
+...         "week": WindowConfig("trigger", "start + 7d", False, True, has={"B": "(1, None)"}),
+...         "target": WindowConfig("trigger", "start + 10d", False, True, label="B"),
+...     },
+... )
+>>> for finding in degeneracies(cfg):
+...     print(finding)
+always_positive: 'week: B (1, None)' guarantees B within the label window (pos(trigger), pos(target.end)]
+>>> cfg = TaskExtractorConfig(
+...     predicates=predicates,
+...     trigger=EventConfig("A"),
+...     windows={
+...         "rest": WindowConfig("trigger", None, False, True, has={"B": "(None, 0)"}),
+...         "target": WindowConfig("trigger -> B", "start + 1d", False, True, label="A"),
+...     },
+... )
+>>> for finding in degeneracies(cfg):
+...     print(finding)
+unsatisfiable: 'rest: B (None, 0)' allows at most 0 but 'target.start is an occurrence of B' guarantees 1
+
+```
+
+The analysis works on the window tree symbolically. Every hop to the next (or prior) occurrence of a
+predicate guarantees one at its landing point and forbids any strictly between the search's start and that
+point; the trigger predicate occurs at the trigger; `(k, None)` criteria are lower bounds and `(None, k)`
+criteria upper bounds over their windows. Lower bounds propagate to enclosing intervals and upper bounds to
+enclosed ones, wherever the enclosure can be proven from the tree's structure (temporal offsets compare
+exactly; an event endpoint is only known to follow the position it was searched from). It is sound but
+incomplete: everything it reports is truly forced, checked by property tests against ACES on random data,
+but it can miss degeneracies that depend on orderings it cannot prove. Inclusivity matters: a label window
+`(trigger, next B]` is *not* always positive, because a `B` at the trigger is the next `B` and makes the
+window empty.
+
 ## Normalized form
 
 Relaxations change what a task means. Before changing anything, it helps to have a canonical way of writing

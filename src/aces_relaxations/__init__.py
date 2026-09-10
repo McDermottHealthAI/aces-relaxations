@@ -12,6 +12,8 @@ Key entry points:
   - [`relax`][aces_relaxations.registry.relax] -- validate, prune, and apply relaxations by name.
   - [`is_future_only`][aces_relaxations.future_only.is_future_only] /
     [`validate_future_only`][aces_relaxations.future_only.validate_future_only] -- the structural property.
+  - [`degeneracies`][aces_relaxations.degeneracy.degeneracies] -- structurally forced labels (always 1 / 0)
+    and unsatisfiable criteria.
   - [`print_ACES`][aces_relaxations.printing.print_ACES] -- a tree pretty-printer for configurations.
 """
 
@@ -22,6 +24,7 @@ from .constraint_simplification import (
     classify_constraint,
     simplify_constraints,
 )
+from .degeneracy import Finding, degeneracies, is_always_negative, is_always_positive, is_unsatisfiable
 from .extraction import (
     extract,
     extract_at,
@@ -58,6 +61,7 @@ __all__ = [
     "ConstraintSimplificationRules",
     "ConstraintTarget",
     "Edge",
+    "Finding",
     "NormalizedTaskConfig",
     "PredicateExpr",
     "RelaxedTaskConfig",
@@ -67,13 +71,17 @@ __all__ = [
     "branches",
     "classify_constraint",
     "collapse_temporal_gap_windows",
+    "degeneracies",
     "extract",
     "extract_at",
     "extract_label_window_bounds",
     "future_only_violations",
     "get_constraint_str",
     "get_predicates",
+    "is_always_negative",
+    "is_always_positive",
     "is_future_only",
+    "is_unsatisfiable",
     "label_node",
     "label_only",
     "label_predicate_expr",
