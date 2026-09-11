@@ -197,7 +197,14 @@ the *normalized form*, produced by `normalize`:
     with ACES's usual `(start, next P]` window a `Q` exactly at the start is not forbidden, so that shape
     only merges when the first window includes its start or excludes its end, or when a `Q` there would
     have stopped the previous hop anyway.
-5. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
+5. Redundant criteria and branches are removed (`aces_relaxations.simplification`): constrained windows
+    with the same prefix and bound merge into one; a criterion implied by another (a tighter bound on an
+    implying / implied predicate over a containing / contained window), by a hop's gap, or by an occurrence
+    guaranteed inside its window goes; a branch that asserts nothing (an unconstrained temporal window, or an
+    unconstrained hop whose landing a criterion guarantees) goes. A hop's landing counts as a guarantee only
+    when some *other* criterion explicitly asserts that the hop lands, so the "bounding event occurs"
+    criteria of step 3 stay: they are what makes realizability explicit for downstream converters.
+6. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
     every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
 
 The result is a genuine ACES configuration, triggered by a synthetic `index_event` predicate that marks the

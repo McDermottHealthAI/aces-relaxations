@@ -45,6 +45,7 @@ from .relaxations import (
     remove_post_label_windows,
     strip_to_relevant_windows,
 )
+from .simplification import simplify_branches
 from .tree import RelaxedTaskConfig, WindowNode, label_node, prediction_time_node, resolve_node
 from .vocabulary import (
     MARGINAL_CODE,
@@ -99,6 +100,7 @@ __all__ = [
     "require_bounding_events",
     "resolve_node",
     "restrict_to_vocabulary",
+    "simplify_branches",
     "simplify_constraints",
     "strip_to_relevant_windows",
     "validate_future_only",
