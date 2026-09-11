@@ -309,3 +309,57 @@ def test_require_bounding_events_is_a_no_op_for_aces(task_cfg: TaskExtractorConf
         event("ACES failed on the original configuration")
         return
     assert extract(explicit, MEDS_df).equals(original)
+
+
+@st.composite
+def hop_chain_configs(draw: st.DrawFn) -> TaskExtractorConfig:
+    """A chain ``pt -> w1 (forbids Q) -> w2: start -> Q -> target``, with random inclusivity and shapes.
+
+    ``w1`` is temporal or event-bounded and forbids ``Q`` (or a predicate ``Q`` implies); ``w2`` hops to the
+    next ``Q``; the label window follows. The normalized label branch should merge ``w1`` and ``w2`` into one
+    hop exactly when the flags make that provably exact.
+    """
+    predicates = {c: PlainPredicateConfig(c) for c in CODES}
+    predicates["A_or_B"] = DerivedPredicateConfig("or(A, B)")
+    q = draw(st.sampled_from(CODES))
+    forbidden = "A_or_B" if q in ("A", "B") and draw(st.booleans()) else q
+    s1, e1, e2 = draw(st.booleans()), draw(st.booleans()), draw(st.booleans())
+    if draw(st.booleans()):
+        w1_end = f"start + {draw(st.integers(1, 5))}d"
+    else:
+        w1_end = f"start -> {draw(st.sampled_from(PREDICATES))}"
+    windows = {
+        "input": WindowConfig(
+            "trigger", f"start + {draw(st.integers(1, 3))}d", False, True, index_timestamp="end"
+        ),
+        "w1": WindowConfig("input.end", w1_end, s1, e1, has={forbidden: "(None, 0)"}),
+        "w2": WindowConfig("w1.end", f"start -> {q}", draw(st.booleans()), e2),
+        "target": WindowConfig(
+            "w2.end",
+            f"start + {draw(st.integers(1, 7))}d",
+            draw(st.booleans()),
+            True,
+            label=draw(st.sampled_from(PREDICATES)),
+        ),
+    }
+    return TaskExtractorConfig(predicates=predicates, trigger=EventConfig("A"), windows=windows)
+
+
+@SETTINGS
+@given(hop_chain_configs(), meds_data())
+def test_hop_collapse_preserves_labels_and_fires_when_exact(
+    task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame
+):
+    """The merged hop preserves labels, and is applied exactly when the flag pattern makes it exact."""
+    w1, w2 = task_cfg.windows["w1"], task_cfg.windows["w2"]
+    expected = (w2.end_inclusive or w1.end_inclusive) and (
+        w1.start_inclusive or w1.end.startswith("start +") or not w1.end_inclusive
+    )
+    normalized = normalize(task_cfg)
+    merged = any("w1__w2" in e.name for e in normalized.label_branch.edges)
+    event("merged" if merged else "kept")
+    assert merged == expected, f"merged={merged}, expected={expected}:\n{normalized.label_branch}"
+
+    original = extract(task_cfg, MEDS_df)
+    assume(len(original) > 0)
+    assert extract_at(normalized, MEDS_df, original).equals(original)

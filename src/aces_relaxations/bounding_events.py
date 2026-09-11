@@ -163,19 +163,19 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
                 if plain:
                     # both endpoints inclusive: ACES resolves ``anchor -> P`` at-or-after the anchor, so
                     # a bounding event coincident with the anchor must be counted ([t, t], not (t, t])
-                    aux_args = dict(
-                        start=anchor_expr,
-                        end=f"start -> {predicate}",
-                        start_inclusive=True,
-                        end_inclusive=True,
-                    )
+                    aux_args = {
+                        "start": anchor_expr,
+                        "end": f"start -> {predicate}",
+                        "start_inclusive": True,
+                        "end_inclusive": True,
+                    }
             if aux_args is None:
-                aux_args = dict(
-                    start=f"{name}.{side}",
-                    end=f"start -> {predicate}",
-                    start_inclusive=True,
-                    end_inclusive=True,
-                )
+                aux_args = {
+                    "start": f"{name}.{side}",
+                    "end": f"start -> {predicate}",
+                    "start_inclusive": True,
+                    "end_inclusive": True,
+                }
             already = any(
                 w.start == aux_args["start"]
                 and w.end == aux_args["end"]

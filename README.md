@@ -188,7 +188,13 @@ the *normalized form*, produced by `normalize`:
     leading to it, then the constrained window. The label window's branch carries no criteria at all, and
     unconstrained event-bounded leaf windows stay as branches because ACES drops rows whose event-bounded
     windows cannot be realized.
-4. Along each branch, runs of unconstrained, unlabeled, temporal windows collapse into one window.
+4. Along each branch, runs of unconstrained, unlabeled windows whose composition is a single window
+    collapse into it: two temporal windows into one of the summed size, and a window followed by a hop to
+    the next `Q` into one hop to the next `Q` from the first window's start whenever the original
+    configuration forbids `Q` over that first window (its criterion lives on its own branch, so the merge
+    changes nothing). Exactness at the endpoints is checked: with ACES's usual `(start, next P]` window a
+    `Q` exactly at the start is not forbidden, so that shape only merges when the first window includes its
+    start or excludes its end.
 5. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
     every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
 
@@ -1138,17 +1144,17 @@ Beyond named relaxations, `aces_relaxations.reductions` holds the two structural
 reduced-query-language converter shares, operating on the normalized form:
 
 - **`label_only(normalized)`** keeps the label branch alone, dropping every condition branch. This is
-  the *conditional independence* assumption: criteria (and event-bounded realizability requirements)
-  are taken not to change the label's distribution. It is provably violated when a dropped criterion
-  shares plain-predicate codes with the label (e.g. a gap window forbidding the label code, or an
-  inclusion criterion requiring it) — converters should surface the dropped branches so such tasks can
-  be recognized.
+    the *conditional independence* assumption: criteria (and event-bounded realizability requirements)
+    are taken not to change the label's distribution. It is provably violated when a dropped criterion
+    shares plain-predicate codes with the label (e.g. a gap window forbidding the label code, or an
+    inclusion criterion requiring it) — converters should surface the dropped branches so such tasks can
+    be recognized.
 - **`last_link_target(normalized)`** reduces the label branch to its last window, re-rooted at that
-  window's own start. This is the *TTE stationarity* assumption: the model's prediction at the
-  prediction time stands in for the prediction it would make at the label window's true start. The
-  label window keeps its own extent; the discarded intermediate windows' time is gone. The result is a
-  `TargetWindow`: a fixed-duration, event-bounded, or to-record-end window over the label predicate,
-  with a `note` recording any approximation made in re-rooting a look-back window.
+    window's own start. This is the *TTE stationarity* assumption: the model's prediction at the
+    prediction time stands in for the prediction it would make at the label window's true start. The
+    label window keeps its own extent; the discarded intermediate windows' time is gone. The result is a
+    `TargetWindow`: a fixed-duration, event-bounded, or to-record-end window over the label predicate,
+    with a `note` recording any approximation made in re-rooting a look-back window.
 
 ```pycon
 >>> from aces_relaxations import label_only, last_link_target
