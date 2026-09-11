@@ -50,7 +50,7 @@ from aces.types import TemporalWindowBounds, ToEventWindowBounds
 from bigtree import Node
 
 from .bounding_events import require_bounding_events
-from .future_only import _initial_state, backward_edge_reason, validate_future_only
+from .future_only import _implies, _initial_state, backward_edge_reason, validate_future_only
 from .guarantees import anchor_counts
 from .tree import prediction_time_node
 
@@ -440,8 +440,51 @@ def _walk(
         stack.append(edge.unconstrained())
 
 
-def _collapse(branch: Branch) -> Branch:
-    """Merges runs of unconstrained, unlabeled, temporal windows.
+def _never(task_cfg: TaskExtractorConfig | None, edge: Edge) -> frozenset[str] | None:
+    """The predicates the configuration forbids over an edge's window (``None`` if the edge is no window).
+
+    Only a forward edge that *is* one of the configuration's windows (same name, same bound) has known
+    criteria; rewound and merged edges do not, unless recorded by ``_collapse`` itself.
+    """
+    if task_cfg is None:
+        return None
+    node = task_cfg.window_nodes.get(f"{edge.name}.end")
+    if node is None or _bound_key(node.endpoint_expr) != _bound_key(edge.bound):
+        return None
+    return frozenset(p for p, (lo, hi) in task_cfg.windows[edge.name].has.items() if hi == 0)
+
+
+def _mergeable_hop(prev: Edge, edge: Edge, never: frozenset[str], implies) -> bool | None:
+    """Whether ``prev`` then a hop to the next ``Q`` is one hop to the next ``Q`` from ``prev``'s start.
+
+    That holds when no ``Q`` can occur where the longer search looks but the shorter one does not: strictly
+    inside ``prev``'s window (which some forbidden predicate ``Q`` implies must cover), at ``prev``'s end
+    when the hop is strict (so ``prev`` must include its end), and at ``prev``'s start when the longer
+    search would include it (so either ``prev`` includes its start, or the search is made exclusive, which
+    is only safe when ``prev``'s end is certainly after its start).
+
+    Returns:
+        The inclusivity of the merged hop's found endpoint, or ``None`` if the windows cannot be merged.
+    """
+    if not any(implies(edge.event, q) for q in never):
+        return None
+    if not edge.bound.right_inclusive and not prev.bound.right_inclusive:
+        return None
+    if prev.bound.left_inclusive:
+        return edge.bound.right_inclusive
+    if prev.is_temporal or not prev.bound.right_inclusive:
+        return False
+    return None
+
+
+def _collapse(branch: Branch, task_cfg: TaskExtractorConfig | None = None, implies=None) -> Branch:
+    """Merges runs of unconstrained, unlabeled windows whose composition is a single window.
+
+    Two consecutive temporal windows are one temporal window of the summed size. A window followed by a hop
+    to the next ``Q`` is one hop to the next ``Q`` from the first window's start when the configuration
+    forbids ``Q`` (or a predicate ``Q`` implies) over the first window, since the hop then lands on the
+    same event either way (see ``_mergeable_hop``). Criteria on the original windows are what make this
+    valid, and the normalized form keeps every criterion on its own branch, so the merge preserves labels.
 
     Examples:
         >>> a = Edge("a", TemporalWindowBounds(True, timedelta(days=7), True))
@@ -458,14 +501,55 @@ def _collapse(branch: Branch) -> Branch:
         >>> d = Edge("d", TemporalWindowBounds(False, timedelta(days=3), True), label="death")
         >>> print(_collapse(Branch((a, d))))
         a: start + 7 days -> d: start + 3 days; label=death
+
+    Merging a hop needs the configuration, to know what its windows forbid. Here the stay (from its start
+    up to the next discharge) forbids admissions, so the next admission after the discharge is the next
+    admission after the stay's start:
+
+        >>> from aces.config import EventConfig
+        >>> from .future_only import _implies
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={p: PlainPredicateConfig(p) for p in ("admission", "discharge", "death")},
+        ...     trigger=EventConfig("admission"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "stay": WindowConfig(
+        ...             "input.end", "start -> discharge", True, True, has={"admission": "(None, 0)"}
+        ...         ),
+        ...         "readmission": WindowConfig("stay.end", "start -> admission", False, True),
+        ...         "target": WindowConfig("readmission.end", "start + 30d", False, True, label="death"),
+        ...     },
+        ... )
+        >>> stay = Edge("stay", ToEventWindowBounds(True, "discharge", True))
+        >>> readmission = Edge("readmission", ToEventWindowBounds(False, "admission", True))
+        >>> target = Edge("target", TemporalWindowBounds(False, timedelta(days=30), True), label="death")
+        >>> print(_collapse(Branch((stay, readmission, target)), cfg, _implies(cfg)))
+        stay__readmission: start -> admission -> target: start + 30 days; label=death
+
+    The merged hop keeps the original hop's inclusivity. Without the criterion nothing merges:
+
+        >>> cfg.windows["stay"].has = {}
+        >>> print(_collapse(Branch((stay, readmission, target)), cfg, _implies(cfg)))
+        stay: start -> discharge -> readmission: start -> admission -> target: start + 30 days; label=death
+
+    Nor does a stay that excludes its start but includes its (event) end, ACES's usual ``(start, next
+    discharge]``: an admission exactly at the stay's start is not forbidden, and whether the original chain
+    lands on it depends on whether a discharge is there too (then the stay is zero-length and the hop finds
+    the admission), which a single hop from the start cannot reproduce either way:
+
+        >>> cfg.windows["stay"].has = {"admission": (None, 0)}
+        >>> usual = Edge("stay", ToEventWindowBounds(False, "discharge", True))
+        >>> cfg.windows["stay"].start_inclusive = False
+        >>> cfg.window_nodes["stay.end"].endpoint_expr = usual.bound
+        >>> print(_collapse(Branch((usual, readmission, target)), cfg, _implies(cfg)))
+        stay: start -> discharge -> readmission: start -> admission -> target: start + 30 days; label=death
     """
     merged: list[Edge] = []
+    never: list[frozenset[str] | None] = []
     for edge in branch.edges:
         prev = merged[-1] if merged else None
-        mergeable = (
+        plain = (
             prev is not None
-            and prev.is_temporal
-            and edge.is_temporal
             and not prev.is_end_rooted
             and not edge.is_end_rooted
             and not prev.is_constrained
@@ -473,13 +557,28 @@ def _collapse(branch: Branch) -> Branch:
             and prev.label is None
             and edge.label is None
         )
-        if mergeable:
+        edge_never = _never(task_cfg, edge)
+        if plain and prev.is_temporal and edge.is_temporal:
             total = prev.bound.window_size + edge.bound.window_size
             bound = TemporalWindowBounds(prev.bound.left_inclusive, total, edge.bound.right_inclusive)
             merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
-        else:
-            merged.append(edge)
+            never[-1] = _both(never[-1], edge_never)
+            continue
+        if plain and not edge.is_temporal and edge.event != RECORD_END and never[-1] is not None:
+            inclusive = _mergeable_hop(prev, edge, never[-1], implies)
+            if inclusive is not None:
+                bound = ToEventWindowBounds(prev.bound.left_inclusive, edge.event, inclusive)
+                merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
+                never[-1] = _both(never[-1], edge_never)
+                continue
+        merged.append(edge)
+        never.append(edge_never)
     return Branch(tuple(merged))
+
+
+def _both(a: frozenset[str] | None, b: frozenset[str] | None) -> frozenset[str] | None:
+    """The predicates forbidden over the union of two windows: those forbidden over each."""
+    return None if a is None or b is None else a & b
 
 
 @dataclass
@@ -550,7 +649,8 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
         >>> for b in branches(in_hosp_mortality_cfg): print(b)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         gap: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
-        gap: start + 1 day -> target_bounding_event: start -> discharge_or_death (discharge_or_death: (1, None))
+        gap: start + 1 day -> target_bounding_event: start -> discharge_or_death (discharge_or_death: (1,
+        None))
         >>> for b in branches(post_discharge_mortality_cfg): print(b)
         hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
         post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
@@ -571,12 +671,13 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
     """
     validate_future_only(task_cfg)
     task_cfg = require_bounding_events(task_cfg)
+    implies = _implies(task_cfg)
     root = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
 
     seen: dict[Branch, None] = {}
     for leaf in _future_leaves(task_cfg, root):
         for branch in _walk(task_cfg, root, leaf, allow_end_rooted):
-            seen[_collapse(branch)] = None
+            seen[_collapse(branch, task_cfg, implies)] = None
 
     ordered = list(seen)
     return tuple(sorted(ordered, key=lambda b: (not b.is_label_branch, ordered.index(b))))
