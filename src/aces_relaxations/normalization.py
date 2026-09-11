@@ -463,6 +463,7 @@ def _is_identity_hop(state: PathState, edge: Edge, counts: bool) -> bool:
         return False
     return any(
         g.start == g.end == state.pos
+        and not g.predicate.startswith("_RECORD_")
         and (edge.event == "_ANY_EVENT" or state.implies(g.predicate, edge.event))
         for g in state.guarantees
     )
