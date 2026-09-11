@@ -190,11 +190,13 @@ the *normalized form*, produced by `normalize`:
     windows cannot be realized.
 4. Along each branch, runs of unconstrained, unlabeled windows whose composition is a single window
     collapse into it: two temporal windows into one of the summed size, and a window followed by a hop to
-    the next `Q` into one hop to the next `Q` from the first window's start whenever the original
-    configuration forbids `Q` over that first window (its criterion lives on its own branch, so the merge
-    changes nothing). Exactness at the endpoints is checked: with ACES's usual `(start, next P]` window a
-    `Q` exactly at the start is not forbidden, so that shape only merges when the first window includes its
-    start or excludes its end.
+    the next `Q` into one hop to the next `Q` from the first window's start whenever `Q` is provably absent
+    wherever the longer search would additionally look (by a criterion on any window covering it, or by an
+    earlier hop's gap, e.g. `-> A_or_B` then `-> A`). A hop that lands where it starts (an inclusive search
+    for an event the position already is) drops out of the chain. Exactness at the endpoints is checked:
+    with ACES's usual `(start, next P]` window a `Q` exactly at the start is not forbidden, so that shape
+    only merges when the first window includes its start or excludes its end, or when a `Q` there would
+    have stopped the previous hop anyway.
 5. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
     every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
 

@@ -50,8 +50,9 @@ from aces.types import TemporalWindowBounds, ToEventWindowBounds
 from bigtree import Node
 
 from .bounding_events import require_bounding_events
-from .future_only import _implies, _initial_state, backward_edge_reason, validate_future_only
-from .guarantees import anchor_counts
+from .degeneracy import Analysis, Interval
+from .future_only import _initial_state, backward_edge_reason, validate_future_only
+from .guarantees import PathState, anchor_counts
 from .tree import prediction_time_node
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,12 @@ def _walk(
         if backward_edge_reason(node) is None:
             name = window_name if is_own else f"{window_name}_{side}_gap"
             edge = Edge(name, bound, constraints, node_label)
+            if _is_identity_hop(state, edge, counts):
+                # The search finds the event at the current position, so the chain does not move: the
+                # window is emitted (as a point or empty window) but contributes nothing to the chain.
+                state.add_criteria(raw_constraints, before, state.pos)
+                yield from emit(edge, is_leaf)
+                continue
             if edge.is_temporal:
                 state.advance_temporal(bound.window_size)
             else:
@@ -440,51 +447,87 @@ def _walk(
         stack.append(edge.unconstrained())
 
 
-def _never(task_cfg: TaskExtractorConfig | None, edge: Edge) -> frozenset[str] | None:
-    """The predicates the configuration forbids over an edge's window (``None`` if the edge is no window).
+def _is_identity_hop(state: PathState, edge: Edge, counts: bool) -> bool:
+    """Whether a forward hop lands where it starts: an inclusive search for an event the position already is.
 
-    Only a forward edge that *is* one of the configuration's windows (same name, same bound) has known
-    criteria; rewound and merged edges do not, unless recorded by ``_collapse`` itself.
+    Examples:
+        >>> state = PathState(lambda g, p: g == p)
+        >>> state.advance_event("B")
+        >>> again = Edge("again", ToEventWindowBounds(False, "B", True))
+        >>> _is_identity_hop(state, again, counts=True), _is_identity_hop(state, again, counts=False)
+        (True, False)
+        >>> _is_identity_hop(state, Edge("c", ToEventWindowBounds(False, "C", True)), counts=True)
+        False
     """
-    if task_cfg is None:
+    if edge.is_temporal or edge.is_end_rooted or edge.event == RECORD_END or not counts:
+        return False
+    return any(
+        g.start == g.end == state.pos
+        and (edge.event == "_ANY_EVENT" or state.implies(g.predicate, edge.event))
+        for g in state.guarantees
+    )
+
+
+def _edge_interval(analysis: Analysis, edge: Edge) -> Interval | None:
+    """The interval of an edge that is one of the analyzed configuration's forward windows (else ``None``)."""
+    node = analysis.task_cfg.window_nodes.get(f"{edge.name}.end")
+    if edge.is_end_rooted or node is None or _bound_key(node.endpoint_expr) != _bound_key(edge.bound):
         return None
-    node = task_cfg.window_nodes.get(f"{edge.name}.end")
-    if node is None or _bound_key(node.endpoint_expr) != _bound_key(edge.bound):
-        return None
-    return frozenset(p for p, (lo, hi) in task_cfg.windows[edge.name].has.items() if hi == 0)
+    return analysis.window(edge.name)
 
 
-def _mergeable_hop(prev: Edge, edge: Edge, never: frozenset[str], implies) -> bool | None:
-    """Whether ``prev`` then a hop to the next ``Q`` is one hop to the next ``Q`` from ``prev``'s start.
+def _forbidden(analysis: Analysis, predicate: str, region: Interval) -> bool:
+    """Whether some criterion or hop provably forbids ``predicate`` over all of ``region``."""
+    if analysis.is_empty(region):
+        return True
+    return any(
+        b.at_most == 0 and analysis.implies(predicate, b.predicate) and analysis.contains(b.interval, region)
+        for b in analysis.bounds
+    )
 
-    That holds when no ``Q`` can occur where the longer search looks but the shorter one does not: strictly
-    inside ``prev``'s window (which some forbidden predicate ``Q`` implies must cover), at ``prev``'s end
-    when the hop is strict (so ``prev`` must include its end), and at ``prev``'s start when the longer
-    search would include it (so either ``prev`` includes its start, or the search is made exclusive, which
-    is only safe when ``prev``'s end is certainly after its start).
+
+def _mergeable_hop(analysis: Analysis, prev: Edge, region: Interval, edge: Edge) -> bool | None:
+    """Whether ``prev`` (spanning ``region``) then a hop to the next ``Q`` is one hop to the next ``Q``.
+
+    That holds when no ``Q`` can occur where the longer search looks but the shorter one does not, which
+    some criterion or hop of the configuration must forbid: strictly inside ``prev``'s window, at ``prev``'s
+    end when the hop is strict, and at ``prev``'s start when the merged search includes it (so either the
+    start is covered, or the merged search is made exclusive, which is only safe when ``prev``'s end is
+    certainly after its start or the original hop was strict).
 
     Returns:
         The inclusivity of the merged hop's found endpoint, or ``None`` if the windows cannot be merged.
     """
-    if not any(implies(edge.event, q) for q in never):
+    q = edge.event
+    inclusive = edge.bound.right_inclusive
+    interior = Interval(region.lo, region.hi, False, False)
+    if not _forbidden(analysis, q, interior):
         return None
-    if not edge.bound.right_inclusive and not prev.bound.right_inclusive:
+    if not inclusive and not _forbidden(analysis, q, Interval.point(region.hi)):
         return None
-    if prev.bound.left_inclusive:
-        return edge.bound.right_inclusive
-    if prev.is_temporal or not prev.bound.right_inclusive:
+    # A ``Q`` at the start is harmless when the previous hop, searching inclusively for something ``Q``
+    # implies, would itself have stopped there, so that the original chain sees it too.
+    stops_there = (
+        not prev.is_temporal
+        and prev.bound.right_inclusive
+        and prev.event != RECORD_END
+        and analysis.implies(q, prev.event)
+    )
+    if stops_there or _forbidden(analysis, q, Interval.point(region.lo)):
+        return inclusive
+    if not inclusive or analysis.leq(region.lo, region.hi, strict=True):
         return False
     return None
 
 
-def _collapse(branch: Branch, task_cfg: TaskExtractorConfig | None = None, implies=None) -> Branch:
+def _collapse(branch: Branch, analysis: Analysis | None = None) -> Branch:
     """Merges runs of unconstrained, unlabeled windows whose composition is a single window.
 
     Two consecutive temporal windows are one temporal window of the summed size. A window followed by a hop
     to the next ``Q`` is one hop to the next ``Q`` from the first window's start when the configuration
-    forbids ``Q`` (or a predicate ``Q`` implies) over the first window, since the hop then lands on the
-    same event either way (see ``_mergeable_hop``). Criteria on the original windows are what make this
-    valid, and the normalized form keeps every criterion on its own branch, so the merge preserves labels.
+    provably forbids ``Q`` (or a predicate ``Q`` implies) where the longer search would additionally look:
+    by a criterion on any window covering it, or by an earlier hop's gap (see ``_mergeable_hop``). The
+    normalized form keeps every criterion on its own branch and every hop, so the merge preserves labels.
 
     Examples:
         >>> a = Edge("a", TemporalWindowBounds(True, timedelta(days=7), True))
@@ -502,12 +545,11 @@ def _collapse(branch: Branch, task_cfg: TaskExtractorConfig | None = None, impli
         >>> print(_collapse(Branch((a, d))))
         a: start + 7 days -> d: start + 3 days; label=death
 
-    Merging a hop needs the configuration, to know what its windows forbid. Here the stay (from its start
-    up to the next discharge) forbids admissions, so the next admission after the discharge is the next
-    admission after the stay's start:
+    Merging a hop needs the configuration's analysis, to know what is forbidden where. Here the stay (from
+    its start up to the next discharge) forbids admissions, so the next admission after the discharge is
+    the next admission after the stay's start:
 
         >>> from aces.config import EventConfig
-        >>> from .future_only import _implies
         >>> cfg = TaskExtractorConfig(
         ...     predicates={p: PlainPredicateConfig(p) for p in ("admission", "discharge", "death")},
         ...     trigger=EventConfig("admission"),
@@ -523,29 +565,76 @@ def _collapse(branch: Branch, task_cfg: TaskExtractorConfig | None = None, impli
         >>> stay = Edge("stay", ToEventWindowBounds(True, "discharge", True))
         >>> readmission = Edge("readmission", ToEventWindowBounds(False, "admission", True))
         >>> target = Edge("target", TemporalWindowBounds(False, timedelta(days=30), True), label="death")
-        >>> print(_collapse(Branch((stay, readmission, target)), cfg, _implies(cfg)))
+        >>> print(_collapse(Branch((stay, readmission, target)), Analysis.of(cfg)))
         stay__readmission: start -> admission -> target: start + 30 days; label=death
 
     The merged hop keeps the original hop's inclusivity. Without the criterion nothing merges:
 
         >>> cfg.windows["stay"].has = {}
-        >>> print(_collapse(Branch((stay, readmission, target)), cfg, _implies(cfg)))
+        >>> cfg = TaskExtractorConfig(predicates=cfg.predicates, trigger=cfg.trigger, windows=cfg.windows)
+        >>> print(_collapse(Branch((stay, readmission, target)), Analysis.of(cfg)))
         stay: start -> discharge -> readmission: start -> admission -> target: start + 30 days; label=death
+
+    The criterion may sit on any window provably covering the first one, not only on that window itself.
+    Here a week-long wait is followed by a hop to the next admission, and a month-long window forbids
+    admissions:
+
+        >>> cfg.windows["stay"] = WindowConfig("input.end", "start + 7d", True, True)
+        >>> cfg.windows["cover"] = WindowConfig(
+        ...     "input.end", "start + 30d", True, True, has={"admission": "(None, 0)"}
+        ... )
+        >>> cfg = TaskExtractorConfig(predicates=cfg.predicates, trigger=cfg.trigger, windows=cfg.windows)
+        >>> week = Edge("stay", TemporalWindowBounds(True, timedelta(days=7), True))
+        >>> print(_collapse(Branch((week, readmission, target)), Analysis.of(cfg)))
+        stay__readmission: start -> admission -> target: start + 30 days; label=death
+
+    A hop to a predicate implied by the previous hop's event also merges, since that hop's gap forbids it:
+
+        >>> from aces.config import DerivedPredicateConfig
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={
+        ...         "A": PlainPredicateConfig("A"),
+        ...         "B": PlainPredicateConfig("B"),
+        ...         "C": PlainPredicateConfig("C"),
+        ...         "A_or_B": DerivedPredicateConfig("or(A, B)"),
+        ...     },
+        ...     trigger=EventConfig("C"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "either": WindowConfig("input.end", "start -> A_or_B", True, True),
+        ...         "a": WindowConfig("either.end", "start -> A", False, True),
+        ...         "target": WindowConfig("a.end", "start + 3d", False, True, label="C"),
+        ...     },
+        ... )
+        >>> either = Edge("either", ToEventWindowBounds(True, "A_or_B", True))
+        >>> a = Edge("a", ToEventWindowBounds(False, "A", True))
+        >>> t = Edge("target", TemporalWindowBounds(False, timedelta(days=3), True), label="C")
+        >>> print(_collapse(Branch((either, a, t)), Analysis.of(cfg)))
+        either__a: start -> A -> target: start + 3 days; label=C
 
     Nor does a stay that excludes its start but includes its (event) end, ACES's usual ``(start, next
     discharge]``: an admission exactly at the stay's start is not forbidden, and whether the original chain
     lands on it depends on whether a discharge is there too (then the stay is zero-length and the hop finds
     the admission), which a single hop from the start cannot reproduce either way:
 
-        >>> cfg.windows["stay"].has = {"admission": (None, 0)}
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={p: PlainPredicateConfig(p) for p in ("admission", "discharge", "death")},
+        ...     trigger=EventConfig("admission"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "stay": WindowConfig(
+        ...             "input.end", "start -> discharge", False, True, has={"admission": "(None, 0)"}
+        ...         ),
+        ...         "readmission": WindowConfig("stay.end", "start -> admission", False, True),
+        ...         "target": WindowConfig("readmission.end", "start + 30d", False, True, label="death"),
+        ...     },
+        ... )
         >>> usual = Edge("stay", ToEventWindowBounds(False, "discharge", True))
-        >>> cfg.windows["stay"].start_inclusive = False
-        >>> cfg.window_nodes["stay.end"].endpoint_expr = usual.bound
-        >>> print(_collapse(Branch((usual, readmission, target)), cfg, _implies(cfg)))
+        >>> print(_collapse(Branch((usual, readmission, target)), Analysis.of(cfg)))
         stay: start -> discharge -> readmission: start -> admission -> target: start + 30 days; label=death
     """
     merged: list[Edge] = []
-    never: list[frozenset[str] | None] = []
+    regions: list[Interval | None] = []
     for edge in branch.edges:
         prev = merged[-1] if merged else None
         plain = (
@@ -557,28 +646,28 @@ def _collapse(branch: Branch, task_cfg: TaskExtractorConfig | None = None, impli
             and prev.label is None
             and edge.label is None
         )
-        edge_never = _never(task_cfg, edge)
+        region = None if analysis is None else _edge_interval(analysis, edge)
         if plain and prev.is_temporal and edge.is_temporal:
             total = prev.bound.window_size + edge.bound.window_size
             bound = TemporalWindowBounds(prev.bound.left_inclusive, total, edge.bound.right_inclusive)
             merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
-            never[-1] = _both(never[-1], edge_never)
+            regions[-1] = _span(regions[-1], region)
             continue
-        if plain and not edge.is_temporal and edge.event != RECORD_END and never[-1] is not None:
-            inclusive = _mergeable_hop(prev, edge, never[-1], implies)
+        if plain and not edge.is_temporal and edge.event != RECORD_END and regions[-1] is not None:
+            inclusive = _mergeable_hop(analysis, prev, regions[-1], edge)
             if inclusive is not None:
                 bound = ToEventWindowBounds(prev.bound.left_inclusive, edge.event, inclusive)
                 merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
-                never[-1] = _both(never[-1], edge_never)
+                regions[-1] = _span(regions[-1], region)
                 continue
         merged.append(edge)
-        never.append(edge_never)
+        regions.append(region)
     return Branch(tuple(merged))
 
 
-def _both(a: frozenset[str] | None, b: frozenset[str] | None) -> frozenset[str] | None:
-    """The predicates forbidden over the union of two windows: those forbidden over each."""
-    return None if a is None or b is None else a & b
+def _span(a: Interval | None, b: Interval | None) -> Interval | None:
+    """The interval from the first of two consecutive windows' start to the second's end."""
+    return None if a is None or b is None else Interval(a.lo, b.hi, a.lo_inclusive, b.hi_inclusive)
 
 
 @dataclass
@@ -671,13 +760,13 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
     """
     validate_future_only(task_cfg)
     task_cfg = require_bounding_events(task_cfg)
-    implies = _implies(task_cfg)
+    analysis = Analysis.of(task_cfg)
     root = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
 
     seen: dict[Branch, None] = {}
     for leaf in _future_leaves(task_cfg, root):
         for branch in _walk(task_cfg, root, leaf, allow_end_rooted):
-            seen[_collapse(branch, task_cfg, implies)] = None
+            seen[_collapse(branch, analysis)] = None
 
     ordered = list(seen)
     return tuple(sorted(ordered, key=lambda b: (not b.is_label_branch, ordered.index(b))))
@@ -756,6 +845,37 @@ def normalize(
             ├── (+5 days, 0:00:00) target.end; **Label: Presence of B**
             ├── (next B) watch.end (no A)
             └── (next B) watch_bounding_event.end (at least 1 B)
+
+    A hop that lands where it starts (an inclusive search for an event the position already is) drops out
+    of the chain, and a window followed by a hop to an event that is provably absent in between collapses
+    into one hop (see ``_collapse``). Here ``again`` is an identity hop, and ``either``'s gap forbids ``A``,
+    so the hop to the next ``A`` merges into it:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={
+        ...         "A": PlainPredicateConfig("A"),
+        ...         "B": PlainPredicateConfig("B"),
+        ...         "A_or_B": DerivedPredicateConfig("or(A, B)"),
+        ...     },
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "either": WindowConfig("input.end", "start -> A_or_B", True, True),
+        ...         "again": WindowConfig("either.end", "start -> A_or_B", False, True),
+        ...         "a": WindowConfig("again.end", "start -> A", False, True),
+        ...         "target": WindowConfig("a.end", "start + 3d", False, True, label="B"),
+        ...     },
+        ... )
+        >>> print_ACES(normalize(cfg))
+        trigger; **Prediction Time**
+        ├── (next A) either__a.end
+        │   └── (+3 days, 0:00:00) target.end; **Label: Presence of B**
+        ├── (next A_or_B) either.end
+        │   ├── (next A) a_bounding_event.end (at least 1 A)
+        │   └── (next A_or_B) again_bounding_event.end (at least 1 A_or_B)
+        └── (next A_or_B) either_criteria.end (at least 1 A_or_B)
+
+    (The remaining bounding-event criteria are now redundant; a later pass removes such criteria.)
 
     Windows defined backward from a later endpoint are fine as long as they cannot reach before the
     prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
