@@ -51,7 +51,7 @@ from bigtree import Node
 
 from .bounding_events import require_bounding_events
 from .degeneracy import Analysis, Interval
-from .future_only import _initial_state, backward_edge_reason, validate_future_only
+from .future_only import _implies, _initial_state, backward_edge_reason, validate_future_only
 from .guarantees import PathState, anchor_counts
 from .tree import prediction_time_node
 
@@ -769,7 +769,10 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
         for branch in _walk(task_cfg, root, leaf, allow_end_rooted):
             seen[_collapse(branch, analysis)] = None
 
-    ordered = list(seen)
+    from .simplification import simplify_branches  # circular at module level
+
+    at_pt = [g.predicate for g in _initial_state(task_cfg, root).guarantees]
+    ordered = list(simplify_branches(seen, _implies(task_cfg), at_pt, task_cfg))
     return tuple(sorted(ordered, key=lambda b: (not b.is_label_branch, ordered.index(b))))
 
 
@@ -872,11 +875,11 @@ def normalize(
         ├── (next A) either__a.end
         │   └── (+3 days, 0:00:00) target.end; **Label: Presence of B**
         ├── (next A_or_B) either.end
-        │   ├── (next A) a_bounding_event.end (at least 1 A)
-        │   └── (next A_or_B) again_bounding_event.end (at least 1 A_or_B)
+        │   └── (next A) a_bounding_event.end (at least 1 A)
         └── (next A_or_B) either_criteria.end (at least 1 A_or_B)
 
-    (The remaining bounding-event criteria are now redundant; a later pass removes such criteria.)
+    (``again``'s own "bounding event occurs" criterion was implied by ``either``'s landing, which
+    ``either_criteria`` asserts, and was removed; see ``aces_relaxations.simplification``.)
 
     Windows defined backward from a later endpoint are fine as long as they cannot reach before the
     prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
