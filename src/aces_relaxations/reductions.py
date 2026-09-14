@@ -176,8 +176,8 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
         >>> last_link_target(normalize(cfg)).describe()
         'B before the end of the record (start exclusive, end inclusive)'
 
-    A look-back to a prior event from an event-bounded end is inverted approximately, and one from the end
-    of the record runs to the end of the record:
+    A look-back to a prior event from an event-bounded end is inverted approximately, except from the end
+    of the record, which is unique:
 
         >>> cfg = TaskExtractorConfig(
         ...     predicates=predicates, trigger=EventConfig("A"),
@@ -203,8 +203,9 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
         ...         "since_b": WindowConfig("end <- B", "rest.end", True, True, label="A"),
         ...     },
         ... )
-        >>> last_link_target(normalize(cfg, allow_end_rooted=True)).describe()
-        'A before the end of the record (start inclusive, end inclusive)'
+        >>> target = last_link_target(normalize(cfg, allow_end_rooted=True))
+        >>> target.describe(), target.note
+        ('A before the end of the record (start inclusive, end inclusive)', 'exact')
 
     And from a fixed-offset end it cannot be inverted:
 
@@ -252,8 +253,13 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
         "only if no other {end_event} intervenes"
     ).replace("{end_event}", end_event)
     if end_event == RECORD_END:
+        # There is exactly one record end, so re-rooting at the last event before it is exact.
         return TargetWindow(
-            label, to_record_end=True, start_inclusive=bound.left_inclusive, end_inclusive=True, note=note
+            label,
+            to_record_end=True,
+            start_inclusive=bound.left_inclusive,
+            end_inclusive=bound.right_inclusive,
+            note="exact",
         )
     return TargetWindow(
         label,
