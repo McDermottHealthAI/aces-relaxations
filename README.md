@@ -267,13 +267,14 @@ ambiguity by stating the requirement as an ordinary criterion, and works on any 
     `P: (1, None)` itself;
 - otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
     not when the window is zero-length with an exclusive other endpoint (`[t, t)` is empty), which happens
-    whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window
-    carries the criterion. For a forward bound whose search anchor is a plain reference, the auxiliary
-    window is a *sibling* repeating the same search from the same anchor with an inclusive end, so it
-    resolves to the same bounding event and counts it — and under infinity semantics it reads directly as
-    an infinite window containing no `P`, failing the criterion. Look-back bounds and hop-valued anchors
-    keep a zero-length singleton anchored at the bounding event itself, whose counting behavior ACES pins
-    down.
+    whenever the bounding event coincides with the other endpoint. Then an auxiliary window carries the
+    criterion, in whichever of two forms is exact. A forward bound with an inclusive end gets a *sibling*
+    repeating the same search from the same anchor, both endpoints inclusive: it resolves to the same
+    bounding event and counts it, and under infinity semantics it reads directly as an infinite window
+    containing no `P`, failing the criterion. Any other bound (a strict forward search, which skips a `P`
+    at its anchor, or a look-back, which ACES resolves strictly before an external anchor) gets a
+    zero-length *singleton* anchored at the bounding event itself, which ACES resolves to `[t, t]` there;
+    no sibling search can be exact for those.
 
 It never adds a criterion that is already implied, so it is idempotent, and it is a no-op for ACES, which
 a property test checks on arbitrary configurations. Both normalized forms apply it first.

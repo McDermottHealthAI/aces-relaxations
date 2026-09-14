@@ -211,6 +211,13 @@ def simplify_branches(
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         stay_bounding_event: start -> discharge (discharge: (1, None))
 
+        An unconstrained hop that nothing proves to land is kept, since ACES drops rows on which it does
+        not:
+
+        >>> for br in simplify_branches([label, bare], implies): print(br)
+        gap: start + 1 day -> target: start -> discharge_or_death; label=death
+        stay: start -> discharge
+
         Record boundaries are positions, not events: a look-back to the record's start is kept as is, and
         the record's start being at the prediction time guarantees no occurrence of anything:
 
