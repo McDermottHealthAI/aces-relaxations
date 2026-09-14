@@ -57,15 +57,15 @@ print_ACES(relaxed)
 
 ## Terminology
 
-| Term           | Description                                                                                                                                                                                                                                         |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ACES           | [ACES](https://eventstreamaces.readthedocs.io/en/latest/) is a domain specific language for describing task cohorts and a tool to automatically extract them from EHR datasets. It is the "source of truth" for task definitions in this work.      |
-| Task Config    | The (original / raw) ACES configuration file that describes the task cohort.                                                                                                                                                                        |
-| Input Window   | The window in the ACES config defining the "prediction time". This is indicated via the `index_timestamp` marker in the ACES config.                                                                                                                |
-| Target Window  | The window in the ACES config over which the label is extracted. This is indicated via the `label` marker in the ACES config.                                                                                                                       |
-| Future-only    | A config is *guaranteeably future-only* when both endpoints of its target window are reachable from the prediction time through edges that only move forward in time, so the label can only depend on data at or after the prediction time.         |
-| Relaxed Config | A config re-rooted at the prediction time and pruned to the windows between it and the target (plus any windows after the target). All relaxations operate on relaxed configs.                                                                      |
-| Relaxation     | A modification to the task config that removes constraints or simplifies the relationships between window endpoints. These are used to simplify or broaden the set of identified empirical labels when the task is posed to a reduced query system. |
+| Term           | Description                                                                                                                                                                                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ACES           | [ACES](https://eventstreamaces.readthedocs.io/en/latest/) is a domain specific language for describing task cohorts and a tool to automatically extract them from EHR datasets. It is the "source of truth" for task definitions in this work.                                             |
+| Task Config    | The (original / raw) ACES configuration file that describes the task cohort.                                                                                                                                                                                                               |
+| Input Window   | The window in the ACES config defining the "prediction time". This is indicated via the `index_timestamp` marker in the ACES config.                                                                                                                                                       |
+| Target Window  | The window in the ACES config over which the label is extracted. This is indicated via the `label` marker in the ACES config.                                                                                                                                                              |
+| Future-only    | A config is *guaranteeably future-only* when both endpoints of its target window are reachable from the prediction time through edges that only move forward in time (or look back by a provably guaranteed amount), so the label can only depend on data at or after the prediction time. |
+| Relaxed Config | A config re-rooted at the prediction time and pruned to the windows between it and the target (plus any windows after the target). All relaxations operate on relaxed configs.                                                                                                             |
+| Relaxation     | A modification to the task config that removes constraints or simplifies the relationships between window endpoints. These are used to simplify or broaden the set of identified empirical labels when the task is posed to a reduced query system.                                        |
 
 ## The future-only property
 
@@ -267,13 +267,14 @@ ambiguity by stating the requirement as an ordinary criterion, and works on any 
     `P: (1, None)` itself;
 - otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
     not when the window is zero-length with an exclusive other endpoint (`[t, t)` is empty), which happens
-    whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window
-    carries the criterion. For a forward bound whose search anchor is a plain reference, the auxiliary
-    window is a *sibling* repeating the same search from the same anchor with an inclusive end, so it
-    resolves to the same bounding event and counts it — and under infinity semantics it reads directly as
-    an infinite window containing no `P`, failing the criterion. Look-back bounds and hop-valued anchors
-    keep a zero-length singleton anchored at the bounding event itself, whose counting behavior ACES pins
-    down.
+    whenever the bounding event coincides with the other endpoint. Then an auxiliary window carries the
+    criterion, in whichever of two forms is exact. A forward bound with an inclusive end gets a *sibling*
+    repeating the same search from the same anchor, both endpoints inclusive: it resolves to the same
+    bounding event and counts it, and under infinity semantics it reads directly as an infinite window
+    containing no `P`, failing the criterion. Any other bound (a strict forward search, which skips a `P`
+    at its anchor, or a look-back, which ACES resolves strictly before an external anchor) gets a
+    zero-length *singleton* anchored at the bounding event itself, which ACES resolves to `[t, t]` there;
+    no sibling search can be exact for those.
 
 It never adds a criterion that is already implied, so it is idempotent, and it is a no-op for ACES, which
 a property test checks on arbitrary configurations. Both normalized forms apply it first.
@@ -1198,12 +1199,12 @@ labeling remain in `MEDS_trajectory_evaluation`.
 
 ## Roadmap
 
-Relaxations planned for reduced query languages used by other foundation models:
-
-- Mapping predicates over codes absent from a model vocabulary onto *nearby* in-vocabulary codes (e.g. via
-    a code hierarchy) rather than the marginal sentinel.
-- Mapping value-based predicates onto code-set predicates given quantized values joined with codes.
-- Simplifying complex multi-window queries into single-window approximations.
+- Ordering-dependent degeneracies and simplifications that the symbolic analysis cannot prove (it only
+    sees orderings that follow from the window tree's structure).
+- Value-based predicates beyond quantized value-bin codes, and `and` (co-occurrence) predicates, which
+    the implication machinery treats conservatively.
+- Mapping predicates over codes absent from a model vocabulary onto *nearby* in-vocabulary codes (a code
+    hierarchy lives with the model, so this belongs in the converters).
 
 ## Repository management
 

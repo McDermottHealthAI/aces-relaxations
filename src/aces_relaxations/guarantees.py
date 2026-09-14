@@ -15,7 +15,7 @@ That is enough to decide the two questions a look-back window raises:
 """
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 Constraint = tuple[int | None, int | None]
@@ -111,10 +111,6 @@ class PathState:
     guarantees: list[Guarantee] = field(default_factory=list)
     pos: Position = field(default_factory=lambda: Position(0))
 
-    def copy(self) -> "PathState":
-        """An independent copy (anchors and guarantees are shared prefixes, so copying lists suffices)."""
-        return replace(self, anchors=list(self.anchors), guarantees=list(self.guarantees))
-
     # ------------------------------------------------------------------------------------------------------
     # Ordering
     # ------------------------------------------------------------------------------------------------------
@@ -131,7 +127,19 @@ class PathState:
         return pos.offset
 
     def not_after(self, earlier: Position, later: Position, strict: bool = False) -> bool:
-        """Whether ``earlier`` is guaranteed not to be after ``later`` (strictly before, if ``strict``)."""
+        """Whether ``earlier`` is guaranteed not to be after ``later`` (strictly before, if ``strict``).
+
+        Examples:
+            >>> state = PathState(lambda g, p: g == p)
+            >>> state.advance_event("discharge", strict=True)
+            >>> state.not_after(Position(0), state.pos), state.not_after(state.pos, Position(0))
+            (True, False)
+
+        A hop that excludes the event at its starting point lands strictly later:
+
+            >>> state.not_after(Position(0), state.pos, strict=True)
+            True
+        """
         while later.anchor != earlier.anchor:
             if later.anchor < earlier.anchor:
                 return False
@@ -183,6 +191,15 @@ class PathState:
             anchor_counts: Whether an occurrence exactly at the current position counts. In ACES a
                 ``start: end <- P`` search includes the end event itself exactly when the window's
                 ``start_inclusive`` flag is set; otherwise the guaranteeing window must end strictly before.
+
+        Examples:
+            The record boundaries are positions rather than events: the record's end is never guaranteed,
+            and guarantees about the record's start do not stand in for events:
+
+            >>> state = PathState(lambda g, p: g == p)
+            >>> state.guarantee_at_prediction_time("_RECORD_START")
+            >>> print(state.guarantee_for("_RECORD_END", True), state.guarantee_for("admission", True))
+            None None
         """
         if predicate == "_RECORD_START":
             # The record start is a fixed point, so inclusivity is irrelevant: it is guaranteed only when the
