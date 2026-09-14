@@ -42,6 +42,8 @@ class TargetWindow:
         >>> discharge = PredicateExpr.leaf("discharge")
         >>> TargetWindow(PredicateExpr.leaf("death"), bounding_event=discharge).describe()
         'death before the next discharge after the window start (start exclusive, end inclusive)'
+        >>> TargetWindow(PredicateExpr.leaf("death"), to_record_end=True, end_inclusive=False).describe()
+        'death before the end of the record (start exclusive, end exclusive)'
     """
 
     label: PredicateExpr
@@ -162,7 +164,20 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
         >>> target.describe(), target.note
         ('B within 1.0 days of the window start (start exclusive, end inclusive)', 'exact')
 
-    A look-back to a prior event from an event-bounded end is inverted approximately:
+    A label window running to the end of the record stays so:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates=predicates, trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "rest": WindowConfig("input.end", None, False, True, label="B"),
+        ...     },
+        ... )
+        >>> last_link_target(normalize(cfg)).describe()
+        'B before the end of the record (start exclusive, end inclusive)'
+
+    A look-back to a prior event from an event-bounded end is inverted approximately, except from the end
+    of the record, which is unique:
 
         >>> cfg = TaskExtractorConfig(
         ...     predicates=predicates, trigger=EventConfig("A"),
@@ -179,6 +194,18 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
         >>> print(target.note)
         the window originally ran from the last B before a discharge to that discharge; re-rooted at the B,
         it runs to the next discharge, which is the same discharge only if no other discharge intervenes
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates=predicates, trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "wait": WindowConfig("input.end", "start + 3d", False, True, has={"B": "(1, None)"}),
+        ...         "rest": WindowConfig("wait.end", None, False, True),
+        ...         "since_b": WindowConfig("end <- B", "rest.end", True, True, label="A"),
+        ...     },
+        ... )
+        >>> target = last_link_target(normalize(cfg, allow_end_rooted=True))
+        >>> target.describe(), target.note
+        ('A before the end of the record (start inclusive, end inclusive)', 'exact')
 
     And from a fixed-offset end it cannot be inverted:
 
@@ -226,8 +253,13 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
         "only if no other {end_event} intervenes"
     ).replace("{end_event}", end_event)
     if end_event == RECORD_END:
+        # There is exactly one record end, so re-rooting at the last event before it is exact.
         return TargetWindow(
-            label, to_record_end=True, start_inclusive=bound.left_inclusive, end_inclusive=True, note=note
+            label,
+            to_record_end=True,
+            start_inclusive=bound.left_inclusive,
+            end_inclusive=bound.right_inclusive,
+            note="exact",
         )
     return TargetWindow(
         label,

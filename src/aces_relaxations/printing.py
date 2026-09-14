@@ -141,6 +141,30 @@ def print_ACES(task_cfg: TaskExtractorConfig, **kwargs):
             └── (next discharge) discharge.end
                 └── (+1 day, 0:00:00) target.start
                     └── (+29 days, 0:00:00) target.end
+
+    ACES accumulates scratch state into each bound's ``offset`` while querying; a tree carrying such state
+    is refused rather than misrendered, as is a node whose endpoint is not a bound at all:
+
+        >>> import copy
+        >>> from datetime import timedelta
+        >>> stale = copy.deepcopy(cfg)
+        >>> stale.window_nodes["gap.end"].endpoint_expr.offset = timedelta(hours=1)
+        >>> print_ACES(stale)
+        Traceback (most recent call last):
+            ...
+        NotImplementedError: Offset not supported.
+        >>> stale = copy.deepcopy(cfg)
+        >>> stale.window_nodes["discharge.end"].endpoint_expr.offset = timedelta(hours=1)
+        >>> print_ACES(stale)
+        Traceback (most recent call last):
+            ...
+        NotImplementedError: Offset not supported.
+        >>> stale = copy.deepcopy(cfg)
+        >>> stale.window_nodes["gap.end"].endpoint_expr = "bogus"
+        >>> print_ACES(stale)
+        Traceback (most recent call last):
+            ...
+        ValueError: Unexpected type <class 'str'> for endpoint expr: bogus.
     """
     index_ts_window_name = getattr(task_cfg, "index_timestamp_window", None)
 

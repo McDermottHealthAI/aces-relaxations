@@ -478,7 +478,21 @@ def _edge_interval(analysis: Analysis, edge: Edge) -> Interval | None:
 
 
 def _forbidden(analysis: Analysis, predicate: str, region: Interval) -> bool:
-    """Whether some criterion or hop provably forbids ``predicate`` over all of ``region``."""
+    """Whether some criterion or hop provably forbids ``predicate`` over all of ``region``.
+
+    Examples:
+        >>> analysis = Analysis.of(in_hosp_mortality_cfg)
+        >>> gap = analysis.window("gap")
+        >>> _forbidden(analysis, "admission", gap), _forbidden(analysis, "death", gap)
+        (True, True)
+        >>> _forbidden(analysis, "death", analysis.window("target"))
+        False
+
+    Nothing occurs in an empty region:
+
+        >>> _forbidden(analysis, "death", Interval(gap.lo, gap.lo, False, False))
+        True
+    """
     if analysis.is_empty(region):
         return True
     return any(
@@ -898,6 +912,32 @@ def normalize(
         ├── (+7 days, 0:00:00) week.end; **Label: Presence of B**
         └── (+6 days, 0:00:00) week__pre_last_day.end
             └── (+1 day, 0:00:00) last_day.end (at least 1 A)
+
+    Window names are kept where possible; a criteria copy of window ``w`` is named ``w_criteria``, and names
+    that are nonetheless taken get a numeric suffix:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={c: PlainPredicateConfig(c) for c in "ABC"},
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "w": WindowConfig("input.end", "start -> B", False, True, has={"C": "(None, 0)"}),
+        ...         "w_criteria": WindowConfig("w.end", "start + 3d", False, True, label="C"),
+        ...     },
+        ... )
+        >>> print_ACES(normalize(cfg))
+        trigger; **Prediction Time**
+        ├── (next B) w.end
+        │   └── (+3 days, 0:00:00) w_criteria.end; **Label: Presence of C**
+        ├── (next B) w_criteria_2.end (no C)
+        └── (next B) w_bounding_event.end (at least 1 B)
+
+    The synthetic index predicate must not collide with an existing one:
+
+        >>> normalize(in_hosp_mortality_cfg, index_predicate="death")
+        Traceback (most recent call last):
+            ...
+        ValueError: Predicate 'death' already exists; choose another index_predicate.
 
     Branches that start by moving backward from the prediction time lie before it and are discarded (with
     a warning); a window that could reach before the prediction time is rejected:
