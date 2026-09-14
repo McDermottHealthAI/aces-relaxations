@@ -350,16 +350,59 @@ def hop_chain_configs(draw: st.DrawFn) -> TaskExtractorConfig:
 def test_hop_collapse_preserves_labels_and_fires_when_exact(
     task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame
 ):
-    """The merged hop preserves labels, and is applied exactly when the flag pattern makes it exact."""
+    """The merged hop preserves labels, and is applied at least when the window's own flags make it exact.
+
+    The merge can also fire for other reasons (an identity hop, a hop gap of the first window covering the
+    second hop's event), so the flag condition is sufficient, not necessary.
+    """
     w1, w2 = task_cfg.windows["w1"], task_cfg.windows["w2"]
     expected = (w2.end_inclusive or w1.end_inclusive) and (
         w1.start_inclusive or w1.end.startswith("start +") or not w1.end_inclusive
     )
     normalized = normalize(task_cfg)
-    merged = any("w1__w2" in e.name for e in normalized.label_branch.edges)
+    names = [e.name for e in normalized.label_branch.edges]
+    # Either the two windows merged into one hop, or the second hop was an identity hop (a search for the
+    # event the first hop landed on) and vanished from the chain.
+    merged = "w1__w2" in names or "w2" not in names
     event("merged" if merged else "kept")
-    assert merged == expected, f"merged={merged}, expected={expected}:\n{normalized.label_branch}"
+    assert merged or not expected, f"not merged although exact by flags:\n{normalized.label_branch}"
 
+    original = extract(task_cfg, MEDS_df)
+    assume(len(original) > 0)
+    assert extract_at(normalized, MEDS_df, original).equals(original)
+
+
+@st.composite
+def identity_hop_configs(draw: st.DrawFn) -> TaskExtractorConfig:
+    """A hop to ``P``, then an inclusive hop to ``P'`` implied by ``P``, then the target window."""
+    predicates = {c: PlainPredicateConfig(c) for c in CODES}
+    predicates["A_or_B"] = DerivedPredicateConfig("or(A, B)")
+    p = draw(st.sampled_from(CODES))
+    p_prime = "A_or_B" if p in ("A", "B") and draw(st.booleans()) else p
+    windows = {
+        "input": WindowConfig(
+            "trigger", f"start + {draw(st.integers(1, 3))}d", False, True, index_timestamp="end"
+        ),
+        "w1": WindowConfig("input.end", f"start -> {p}", draw(st.booleans()), True),
+        "w2": WindowConfig("w1.end", f"start -> {p_prime}", draw(st.booleans()), True),
+        "target": WindowConfig(
+            "w2.end",
+            f"start + {draw(st.integers(1, 7))}d",
+            draw(st.booleans()),
+            True,
+            label=draw(st.sampled_from(PREDICATES)),
+        ),
+    }
+    return TaskExtractorConfig(predicates=predicates, trigger=EventConfig("A"), windows=windows)
+
+
+@SETTINGS
+@given(identity_hop_configs(), meds_data())
+def test_identity_hops_leave_the_chain(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame):
+    """An inclusive hop to an event the position already is drops out of the chain, preserving labels."""
+    normalized = normalize(task_cfg)
+    names = [e.name for e in normalized.label_branch.edges]
+    assert "w2" not in names and not any("w2" in n for n in names), str(normalized.label_branch)
     original = extract(task_cfg, MEDS_df)
     assume(len(original) > 0)
     assert extract_at(normalized, MEDS_df, original).equals(original)
