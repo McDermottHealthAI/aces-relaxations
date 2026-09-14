@@ -141,6 +141,16 @@ class Analysis:
         (True, False, True)
         >>> analysis.leq(pt, target_end, strict=True), analysis.leq(target_end, pt)
         (True, False)
+
+    Positions render by the node they are an offset from, or as a record boundary:
+
+        >>> later, earlier = pt.shifted(timedelta(days=2)), pt.shifted(-timedelta(hours=6))
+        >>> for p in (Position(BOTTOM), Position(TOP), later, earlier):
+        ...     print(analysis.describe(p))
+        pos(record_start)
+        pos(record_end)
+        pos(trigger) + 3 days, 0:00:00
+        pos(trigger) + 18:00:00
     """
 
     task_cfg: TaskExtractorConfig
@@ -446,6 +456,26 @@ def degeneracies(task_cfg: TaskExtractorConfig) -> list[Finding]:
         >>> for f in degeneracies(cfg): print(f)
         unsatisfiable: 'rest: B (None, 0)' allows at most 0 but 'target.start is an occurrence of B'
         guarantees 1
+
+        A lower bound on a window that is provably empty (a zero-length window with an exclusive end) is
+        unsatisfiable, and a label window that is empty forces the label to ``False``:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates=predicates, trigger=EventConfig("A"),
+        ...     windows={
+        ...         "nothing": WindowConfig("trigger", "start + 0d", True, False, has={"B": "(1, None)"}),
+        ...         "target": WindowConfig("trigger", "start + 10d", False, True, label="B"),
+        ...     },
+        ... )
+        >>> for f in degeneracies(cfg): print(f)
+        unsatisfiable: 'nothing: B (1, None)' requires an occurrence in the empty window [pos(trigger),
+        pos(trigger))
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates=predicates, trigger=EventConfig("A"),
+        ...     windows={"target": WindowConfig("trigger", "start + 0d", True, False, label="B")},
+        ... )
+        >>> for f in degeneracies(cfg): print(f)
+        always_negative: the label window [pos(trigger), pos(trigger)) is empty
 
         Counts contradict across nested windows too:
 

@@ -276,6 +276,11 @@ def extract_label_window_bounds(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataF
         │ 2          ┆ 2020-01-02 00:00:00 ┆ 2020-01-03 00:00:00 ┆ 2020-01-04 00:00:00 │
         └────────────┴─────────────────────┴─────────────────────┴─────────────────────┘
 
+    Data yielding no rows gives an empty frame with the same schema:
+
+        >>> extract_label_window_bounds(sample_ACES_cfg, sample_MEDS_df.head(1)).shape
+        (0, 4)
+
     A label window that looks back from the next ``B`` event can start before the prediction time:
 
         >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig

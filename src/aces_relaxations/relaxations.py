@@ -175,6 +175,15 @@ def collapse_temporal_gap_windows(task_cfg: RelaxedTaskConfig) -> RelaxedTaskCon
         └── (next discharge) hospitalization.end (no death)
             └── (+1 day, 0:00:00) gap.end (no admission, death)
                 └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
+
+    A node whose endpoint is not a bound at all is refused:
+
+        >>> cfg = remove_all_criteria(strip_to_relevant_windows(post_discharge_mortality_cfg))
+        >>> cfg.window_nodes["gap.end"].endpoint_expr = "bogus"
+        >>> collapse_temporal_gap_windows(cfg)
+        Traceback (most recent call last):
+            ...
+        ValueError: Unexpected type <class 'str'> for endpoint expr: bogus.
     """
     label_window_node = label_node(task_cfg)
     root_to_label = list(task_cfg.window_nodes[label_window_node.node_name].node_path)

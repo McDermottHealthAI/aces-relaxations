@@ -33,12 +33,13 @@ RECORD_BOUNDARIES = ("_RECORD_START", "_RECORD_END")
 AUXILIARY_SUFFIX = "_bounding_event"
 
 
-def _boundings(window: WindowConfig) -> list[tuple[str, str, bool, str]]:
-    """Each event bound of a window: predicate, bounded side, that side's inclusivity, and the anchor.
+def _boundings(window: WindowConfig) -> list[tuple[str, str, bool, str, bool]]:
+    """Each event bound of a window: predicate, bounded side, that side's inclusivity, anchor, direction.
 
     The anchor is the reference the bound's search runs from: ``"start"`` / ``"end"`` for an internal
-    reference (the window's other side), or the referenced node otherwise (``"trigger"``, ``"w.end"``). A
-    window can be event-bounded on both sides (``start: a.end -> admission``, ``end: start -> discharge``).
+    reference (the window's other side), or the referenced node otherwise (``"trigger"``, ``"w.end"``). The
+    direction is whether the search runs backward (``<- P``). A window can be event-bounded on both sides
+    (``start: a.end -> admission``, ``end: start -> discharge``).
     """
     out = []
     for side, parsed in (("start", window._parsed_start), ("end", window._parsed_end)):
@@ -46,7 +47,7 @@ def _boundings(window: WindowConfig) -> list[tuple[str, str, bool, str]]:
         if not event or event.lstrip("-") in RECORD_BOUNDARIES:
             continue
         inclusive = window.start_inclusive if side == "start" else window.end_inclusive
-        out.append((event.lstrip("-"), side, inclusive, parsed["referenced"]))
+        out.append((event.lstrip("-"), side, inclusive, parsed["referenced"], event.startswith("-")))
     return out
 
 
@@ -128,6 +129,22 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
         └── (+1 day, 0:00:00) input.end; **Prediction Time**
             └── (next B) until_b.end (at least 1 B); **Label: Presence of A**
 
+    A backward search defining a window's *end* (``end: trigger <- B``) gets a sibling look-back window
+    from the same anchor (``start: end <- B``, ``end: trigger``, start inclusive), which lands exactly when
+    some ``B`` is at or before the anchor, as the original search does:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "before": WindowConfig("end - 1d", "trigger <- B", False, False, index_timestamp="start"),
+        ...         "target": WindowConfig("trigger", "start + 1d", True, True, label="B"),
+        ...     },
+        ... )
+        >>> w = require_bounding_events(cfg).windows["before_bounding_event"]
+        >>> w.start, w.end, w.start_inclusive, w.has
+        ('end <- B', 'trigger', True, {'B': (1, None)})
+
     It is a no-op for ACES:
 
         >>> extract(require_bounding_events(sample_ACES_cfg), sample_MEDS_df).equals(
@@ -138,7 +155,7 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
     windows: dict[str, WindowConfig] = copy.deepcopy(task_cfg.windows)
 
     for name, window in list(windows.items()):
-        for predicate, side, inclusive, referenced in _boundings(window):
+        for predicate, side, inclusive, referenced, backward in _boundings(window):
             other_inclusive = window.end_inclusive if side == "start" else window.start_inclusive
             existing = window.has.get(predicate)
             compatible = existing is None or existing[1] is None or existing[1] >= 1
@@ -160,7 +177,16 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
             if side == "end":
                 anchor_expr = window.start if referenced == "start" else referenced
                 plain = anchor_expr is not None and "->" not in anchor_expr and "<-" not in anchor_expr
-                if plain:
+                if plain and backward:
+                    # A look-back from the anchor to the prior ``P``; start inclusive so that a ``P`` at
+                    # the anchor is found (ACES finds it for the original bound when no earlier one exists).
+                    aux_args = {
+                        "start": f"end <- {predicate}",
+                        "end": anchor_expr,
+                        "start_inclusive": True,
+                        "end_inclusive": True,
+                    }
+                elif plain:
                     # both endpoints inclusive: ACES resolves ``anchor -> P`` at-or-after the anchor, so
                     # a bounding event coincident with the anchor must be counted ([t, t], not (t, t])
                     aux_args = {

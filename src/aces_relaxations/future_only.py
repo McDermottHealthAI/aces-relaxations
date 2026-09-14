@@ -95,7 +95,29 @@ def backward_edge_reason(node: Node) -> str | None:
 
 
 def _implies(task_cfg: TaskExtractorConfig):
-    """``implies(g, p)``: an occurrence of predicate ``g`` is also an occurrence of predicate ``p``."""
+    """``implies(g, p)``: an occurrence of predicate ``g`` is also an occurrence of predicate ``p``.
+
+    Examples:
+        >>> from aces.config import DerivedPredicateConfig, EventConfig, PlainPredicateConfig, WindowConfig
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={
+        ...         "a": PlainPredicateConfig("A"),
+        ...         "b": PlainPredicateConfig("B"),
+        ...         "ab": DerivedPredicateConfig("and(a, b)"),
+        ...         "a_or_b": DerivedPredicateConfig("or(a, b)"),
+        ...     },
+        ...     trigger=EventConfig("a"),
+        ...     windows={"w": WindowConfig("trigger", "start + 1d", True, True)},
+        ... )
+        >>> implies = _implies(cfg)
+        >>> implies("a", "a"), implies("a", "a_or_b"), implies("a_or_b", "a")
+        (True, True, False)
+
+    A co-occurrence implies each of its parts, but nothing implies a co-occurrence (except itself):
+
+        >>> implies("ab", "a"), implies("a", "ab"), implies("ab", "ab")
+        (True, False, True)
+    """
 
     def implies(g: str, p: str) -> bool:
         if g == p:
@@ -145,7 +167,8 @@ def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
         >>> future_only_violations(readmission_cfg)
         []
 
-    A configuration lacking a label or prediction time is not future-only:
+    A configuration lacking a label or prediction time is not future-only, nor is one whose label or
+    prediction-time window is named ``trigger`` (a name that collides with the trigger node):
 
         >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
         >>> predicates = {"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")}
@@ -156,6 +179,17 @@ def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
         >>> for v in future_only_violations(cfg): print(v)
         The task configuration must have a label_window defined.
         The task configuration must have a index_timestamp_window defined.
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates=predicates, trigger=EventConfig("A"),
+        ...     windows={
+        ...         "trigger": WindowConfig(
+        ...             "trigger", "start + 1d", True, True, label="B", index_timestamp="start"
+        ...         )
+        ...     },
+        ... )
+        >>> for v in future_only_violations(cfg): print(v)
+        The task configuration must not have a label_window set to 'trigger'.
+        The task configuration must not have a index_timestamp_window set to 'trigger'.
 
     Nor is one where the label window is not reachable from the prediction time:
 
