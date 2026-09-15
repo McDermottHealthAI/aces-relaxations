@@ -12,8 +12,8 @@ and the look-back's end, because the path hopped to its next occurrence or a cri
 it. The check never accepts a configuration whose label could reach into the past of the prediction time.
 
 Windows hanging off the prediction-time-to-label path (rather than lying on it, or after the label) are not
-inspected, because [`strip_to_relevant_windows`][aces_relaxations.relaxations.strip_to_relevant_windows]
-prunes them from the relaxed configuration.
+inspected here; [`normalize`][aces_relaxations.normalization.normalize] checks each such branch on its own
+when it re-roots the configuration at the prediction time.
 """
 
 from contextlib import redirect_stdout
