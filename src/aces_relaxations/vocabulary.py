@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable
 from typing import Literal
 
-from aces.config import PlainPredicateConfig, TaskExtractorConfig
+from aces.config import DerivedPredicateConfig, PlainPredicateConfig, TaskExtractorConfig
 
 MARGINAL_CODE = "_MARGINAL_"
 
@@ -157,7 +157,10 @@ def restrict_to_vocabulary(
 
     The configuration is modified in place and returned. Predicates matching one code become that code;
     predicates matching several become an ``any`` list; predicates matching none are handled per
-    ``unmatched``.
+    ``unmatched``. An ``any`` list whose members are only partly in the vocabulary is, under the
+    ``"marginal"`` policy, split into a derived ``or`` of an in-vocabulary predicate and a marginal one
+    (``<name>__in_vocab`` and ``<name>__marginal``), so that the members the vocabulary cannot express are
+    still counted rather than silently dropped. The trigger predicate is never split (it stays plain).
 
     Args:
         task_cfg: The task configuration to modify.
@@ -212,6 +215,20 @@ def restrict_to_vocabulary(
         └── (+1 day, 0:00:00) input.end; **Prediction Time**
             └── (+30 days, 0:00:00) target.end (no high_glucose); **Label: Presence of dm_or_death**
 
+    An ``any`` list with members in and out of the vocabulary keeps both parts:
+
+        >>> cfg = make_cfg()
+        >>> cfg.predicates["dm"] = PlainPredicateConfig(code={"any": ["ICD9//250.1", "ICD10//E11"]})
+        >>> cfg = restrict_to_vocabulary(cfg, vocab)
+        >>> cfg.predicates["dm"].expr
+        'or(dm__in_vocab, dm__marginal)'
+        >>> cfg.plain_predicates["dm__in_vocab"].code, cfg.plain_predicates["dm__marginal"].code
+        ('ICD9//250.1', '_MARGINAL_')
+        >>> print_ACES(cfg)
+        trigger
+        └── (+1 day, 0:00:00) input.end; **Prediction Time**
+            └── (+30 days, 0:00:00) target.end (no high_glucose); **Label: Presence of dm_or_death**
+
     Other policies:
 
         >>> cfg = restrict_to_vocabulary(make_cfg(), vocab, unmatched="keep")
@@ -260,8 +277,16 @@ def restrict_to_vocabulary(
     if unmatched_names and unmatched == "error":
         raise ValueError(f"Predicates match no vocabulary code: {unmatched_names}.")
 
-    for name, pred in task_cfg.plain_predicates.items():
+    for name, pred in list(task_cfg.plain_predicates.items()):
         codes = matches[name]
+        members = pred.code.get("any", []) if isinstance(pred.code, dict) else []
+        partial = bool(codes) and any(m not in codes for m in members)
+        if partial and unmatched == "marginal" and name != task_cfg.trigger.predicate:
+            in_vocab = PlainPredicateConfig(codes[0] if len(codes) == 1 else {"any": codes})
+            task_cfg.predicates[f"{name}__in_vocab"] = in_vocab
+            task_cfg.predicates[f"{name}__marginal"] = PlainPredicateConfig(marginal_code)
+            task_cfg.predicates[name] = DerivedPredicateConfig(f"or({name}__in_vocab, {name}__marginal)")
+            continue
         if codes:
             pred.code = codes[0] if len(codes) == 1 else {"any": codes}
         elif unmatched == "marginal":
