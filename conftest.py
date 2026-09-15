@@ -1,7 +1,7 @@
 """Test set-up and fixtures code.
 
 Provides sample ACES task configurations to the doctest namespace. Every fixture is function-scoped so that
-relaxations (which mutate in place) never leak between tests.
+in-place transformations (such as ``simplify_constraints``) never leak between tests.
 """
 
 import tempfile
@@ -19,7 +19,7 @@ from aces.config import (
     WindowConfig,
 )
 
-from aces_relaxations import RelaxedTaskConfig, print_ACES, strip_to_relevant_windows
+from aces_relaxations import print_ACES
 from aces_relaxations.extraction import extract
 from aces_relaxations.normalization import normalize
 
@@ -233,8 +233,6 @@ def _setup_doctest_namespace(
             "print_ACES": print_ACES,
             "extract": extract,
             "normalize": normalize,
-            "strip_to_relevant_windows": strip_to_relevant_windows,
-            "RelaxedTaskConfig": RelaxedTaskConfig,
             "WindowConfig": WindowConfig,
             "sample_ACES_cfg": sample_ACES_cfg,
             "sample_MEDS_df": sample_MEDS_df,
