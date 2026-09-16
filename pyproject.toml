@@ -8,12 +8,13 @@ dynamic = ["version"] # Managed by setuptools-scm from git tags
 authors = [
   {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
 ]
-description = "The normalized form, structural properties, and count-constraint simplification of ACES task configurations, for posing future-only tasks to reduced query languages."
+description = "Structural analysis, a label-preserving normal form, and principled approximations of ACES task configurations, for posing EHR prediction tasks to models that cannot run ACES."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 keywords = ["ACES", "MEDS", "EHR", "task definitions", "foundation models", "zero-shot"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -45,6 +46,7 @@ dev = [
   "shfmt-py==4.0.0",
   "hypothesis>=6.167.1",
   "numpy>=2.5.2",
+  "yaml-to-disk>=0.0.5",
 ]
 docs = []
 
@@ -65,6 +67,7 @@ doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 
 [project.urls]
 Homepage = "https://github.com/McDermottHealthAI/aces-relaxations"
+ACES = "https://github.com/justin13601/ACES"
 Issues = "https://github.com/McDermottHealthAI/aces-relaxations/issues"
 
 [tool.ruff]
