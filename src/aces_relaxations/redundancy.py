@@ -20,7 +20,8 @@ share an anchor, so branches sharing a prefix share positions), and removes:
   for rows on which the hop is realizable, and the normalized form makes realizability explicit through
   exactly such criteria ("bounding event occurs"), so a criterion never discharges itself and a shallow
   realizability criterion is never traded for a deeper one: the explicit criteria stay.
-- **Empty branches.** A branch ending in an unconstrained temporal window asserts nothing. One ending in an
+- **Empty branches.** A branch ending in an unconstrained temporal window (forward or look-back) asserts
+  nothing. One ending in an
   unconstrained forward hop asserts that the hop lands, which a surviving lower-bound criterion for an
   implying predicate within the search's range, or an explicitly asserted landing, already guarantees.
 
@@ -335,7 +336,7 @@ def remove_redundancy(
         if terminal.label is not None or terminal.is_constrained:
             kept_branches.append(branch)
             continue
-        if terminal.is_temporal and not terminal.is_end_rooted:
+        if terminal.is_temporal:  # A fixed offset, forward or back, always exists.
             continue
         if terminal.is_end_rooted or terminal.event == END_OF_RECORD_KEY:
             kept_branches.append(branch)

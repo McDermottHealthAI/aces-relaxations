@@ -20,9 +20,10 @@ them without changing the label of any prediction-time row:
    whenever ``Q`` is provably absent wherever the longer search would additionally look. A hop that lands
    where it starts drops out of the chain.
 5. Redundant criteria and branches are removed (see ``aces_relaxations.redundancy``).
-6. Branches sharing an unconstrained prefix share those windows, so the result is again a tree, in which
-   every root-to-leaf path is a chain of windows whose ``start`` is the previous window's exit and whose
-   criteria (if any) sit only on its last window.
+6. Each branch becomes its own chain of windows from the prediction time, copying any windows it has in
+   common with other branches. The window tree is therefore a set of *sticks* hanging off the prediction
+   time: each is a chain whose windows start where the previous one exits, and only its last window carries
+   criteria or the label.
 
 Windows defined backward from a later endpoint (``start: end - 1d``) are rewritten as forward chains when the
 temporal windows before them cover the look-back (the *strict* form). The *universal* form
@@ -40,7 +41,7 @@ made. The property tests check the whole against ACES on random configurations a
 import copy
 import logging
 from collections.abc import Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any
 
@@ -213,7 +214,7 @@ def _walk(
                 state.advance_event(bound.end_event, strict=not counts)
             state.add_criteria(raw_constraints, before, state.pos)
             yield from emit(edge, is_leaf)
-            stack.append(edge.unconstrained())
+            stack.append(replace(edge, constraints=(), label=None))
             continue
 
         # A backward edge. Its window (if this is the window's own node) spans from the new position back
@@ -255,7 +256,7 @@ def _walk(
         edge = Edge(name, bound, constraints, node_label)
         state.add_criteria(raw_constraints, state.pos, before)
         yield from emit(edge, is_leaf)
-        stack.append(edge.unconstrained())
+        stack.append(replace(edge, constraints=(), label=None))
 
 
 def _is_identity_hop(state: PathState, edge: Edge, counts: bool) -> bool:
@@ -484,21 +485,6 @@ def _span(a: Interval | None, b: Interval | None) -> Interval | None:
     return None if a is None or b is None else Interval(a.lo, b.hi, a.lo_inclusive, b.hi_inclusive)
 
 
-@dataclass
-class _Trie:
-    edge: Edge | None = None
-    children: dict[tuple, "_Trie"] = field(default_factory=dict)
-    on_label_path: bool = False
-
-    def insert(self, branch: Branch) -> None:
-        node = self
-        for edge in branch.edges:
-            if edge.shape not in node.children:
-                node.children[edge.shape] = _Trie(edge)
-            node = node.children[edge.shape]
-            node.on_label_path = node.on_label_path or branch.is_label_branch
-
-
 def _future_leaves(task_cfg: TaskExtractorConfig, root: Node) -> list[Node]:
     """The leaves of the prediction-time subtree, excluding branches that start by moving backward.
 
@@ -559,8 +545,7 @@ def _branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> 
         >>> for b in _branches(readmission_cfg): print(b)
         gap: start + 1 day -> target: start + 29 days; label=admission
         gap: start + 1 day (admission: (None, 0), death: (None, 0))
-        gap: start + 1 day -> target: start + 29 days; label=admission -> censoring_protection: start ->
-        end of record (_ANY_EVENT: (1, None))
+        gap__target: start + 30 days -> censoring_protection: start -> end of record (_ANY_EVENT: (1, None))
         >>> for b in _branches(two_stage_cfg): print(b)
         1st_infusion: start -> infusion_end -> 2nd_infusion_start_gap: start -> infusion_start ->
         2nd_infusion: start -> infusion_end; label=adverse_event
@@ -614,9 +599,10 @@ def normalize(
         >>> print_ACES(normalized)
         trigger; **Prediction Time**
         ├── (+1 day, 0:00:00) gap.end
-        │   ├── (next discharge_or_death) target.end; **Label: Presence of death**
-        │   └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
-        └── (+1 day, 0:00:00) gap_criteria.end (no admission, discharge_or_death)
+        │   └── (next discharge_or_death) target.end; **Label: Presence of death**
+        ├── (+1 day, 0:00:00) gap_criteria.end (no admission, discharge_or_death)
+        └── (+1 day, 0:00:00) target_bounding_event__gap.end
+            └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
         >>> print(normalized.label_branch)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         >>> normalized.windows["gap_criteria"].start, normalized.windows["gap_criteria"].end
@@ -624,16 +610,18 @@ def normalize(
         >>> normalized.trigger
         EventConfig(predicate='index_event')
 
-    Windows sharing an unconstrained prefix share those windows in the tree:
+    Every branch is its own chain of windows, even where it starts like another; windows copied into a
+    condition branch are prefixed with the name of the branch's last window:
 
         >>> print_ACES(normalize(post_discharge_mortality_cfg))
         trigger; **Prediction Time**
         ├── (next discharge) hospitalization.end
-        │   ├── (+1 day, 0:00:00) gap.end
-        │   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-        │   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+        │   └── (+1 day, 0:00:00) gap.end
+        │       └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
         ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
         ├── (next discharge) hospitalization_criteria.end (no death)
+        ├── (next discharge) gap_criteria__hospitalization.end
+        │   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
         └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 
     Unconstrained temporal windows collapse; the label window and constrained windows never do:
@@ -652,9 +640,11 @@ def normalize(
         ... )
         >>> print_ACES(normalize(cfg))
         trigger; **Prediction Time**
-        └── (+10 days, 0:00:00) gap1__gap2.end
-            ├── (+5 days, 0:00:00) target.end; **Label: Presence of B**
-            ├── (next B) watch.end (no A)
+        ├── (+10 days, 0:00:00) gap1__gap2.end
+        │   └── (+5 days, 0:00:00) target.end; **Label: Presence of B**
+        ├── (+10 days, 0:00:00) watch__gap1__gap2.end
+        │   └── (next B) watch.end (no A)
+        └── (+10 days, 0:00:00) watch_bounding_event__gap1__gap2.end
             └── (next B) watch_bounding_event.end (at least 1 B)
 
     A hop that lands where it starts (an inclusive search for an event the position already is) drops out
@@ -681,12 +671,12 @@ def normalize(
         trigger; **Prediction Time**
         ├── (next A) either__a.end
         │   └── (+3 days, 0:00:00) target.end; **Label: Presence of B**
-        ├── (next A_or_B) either.end
-        │   └── (next A) a_bounding_event.end (at least 1 A)
-        └── (next A_or_B) either_criteria.end (at least 1 A_or_B)
+        ├── (next A_or_B) either.end (at least 1 A_or_B)
+        └── (next A_or_B) a_bounding_event__either.end
+            └── (next A) a_bounding_event.end (at least 1 A)
 
     (``again``'s own "bounding event occurs" criterion was implied by ``either``'s landing, which
-    ``either_criteria`` asserts, and was removed; see ``aces_relaxations.redundancy``.)
+    the ``either`` branch asserts, and was removed; see ``aces_relaxations.redundancy``.)
 
     Windows defined backward from a later endpoint are fine as long as they cannot reach before the
     prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
@@ -703,7 +693,7 @@ def normalize(
         >>> print_ACES(normalize(cfg))
         trigger; **Prediction Time**
         ├── (+7 days, 0:00:00) week.end; **Label: Presence of B**
-        └── (+6 days, 0:00:00) week__pre_last_day.end
+        └── (+6 days, 0:00:00) last_day__week__pre_last_day.end
             └── (+1 day, 0:00:00) last_day.end (at least 1 A)
 
     Window names are kept where possible; a criteria copy of window ``w`` is named ``w_criteria``, and names
@@ -739,8 +729,9 @@ def normalize(
         trigger; **Prediction Time**
         ├── (+1 day, 0:00:00) gap.end
         │   └── (+29 days, 0:00:00) target.end; **Label: Presence of admission**
-        │       └── (end of record) censoring_protection.end (at least 1 event(s))
-        └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+        ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+        └── (+30 days, 0:00:00) censoring_protection__gap__target.end
+            └── (end of record) censoring_protection.end (at least 1 event(s))
         >>> cfg = TaskExtractorConfig(
         ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
         ...     trigger=EventConfig("A"),
@@ -793,12 +784,17 @@ def normalize(
         >>> print_ACES(universal)
         trigger; **Prediction Time**
         ├── (+5 days, 0:00:00) wait.end
-        │   ├── (next discharge) stay.end
-        │   │   ├── (+30 days, 0:00:00) target.end; **Label: Presence of A**
-        │   │   ├── (-1 day, 0:00:00) last_day.start (at least 1 A)
-        │   │   └── (prior admission) since_admission.start (no A; at least 1 admission)
-        │   └── (next discharge) stay_bounding_event.end (at least 1 discharge)
-        └── (+5 days, 0:00:00) wait_criteria.end (at least 1 admission)
+        │   └── (next discharge) stay.end
+        │       └── (+30 days, 0:00:00) target.end; **Label: Presence of A**
+        ├── (+5 days, 0:00:00) wait_criteria.end (at least 1 admission)
+        ├── (+5 days, 0:00:00) last_day__wait.end
+        │   └── (next discharge) last_day__stay.end
+        │       └── (-1 day, 0:00:00) last_day.start (at least 1 A)
+        ├── (+5 days, 0:00:00) since_admission__wait.end
+        │   └── (next discharge) since_admission__stay.end
+        │       └── (prior admission) since_admission.start (no A; at least 1 admission)
+        └── (+5 days, 0:00:00) stay_bounding_event__wait.end
+            └── (next discharge) stay_bounding_event.end (at least 1 discharge)
         >>> for b in universal.criteria_branches: print(b)
         wait: start + 5 days (admission: (1, None))
         wait: start + 5 days -> stay: start -> discharge -> last_day: end - 1 day (A: (1, None))
@@ -806,7 +802,7 @@ def normalize(
         0), admission: (1, None))
         wait: start + 5 days -> stay_bounding_event: start -> discharge (discharge: (1, None))
         >>> universal.windows["last_day"].start, universal.windows["last_day"].end
-        ('end - 1 day', 'stay.end')
+        ('end - 1 day', 'last_day__stay.end')
 
     Without the criterion guaranteeing an admission after the prediction time, the look-back to a prior
     admission could reach before it and is rejected even in the universal form:
@@ -821,32 +817,31 @@ def normalize(
     """
     normalized_branches = _branches(task_cfg, allow_end_rooted)
 
-    trie = _Trie()
-    for branch in normalized_branches:
-        trie.insert(branch)
-
     windows: dict[str, WindowConfig] = {}
-    used_names: set[str] = set()
 
-    def unique(name: str, edge: Edge) -> str:
-        candidate = f"{name}_criteria" if edge.is_constrained and name in used_names else name
-        base, i = candidate, 2
-        while candidate in used_names:
-            candidate = f"{base}_{i}"
+    def unique(name: str) -> str:
+        candidate, i = name, 2
+        while candidate in windows:
+            candidate = f"{name}_{i}"
             i += 1
-        used_names.add(candidate)
         return candidate
 
-    def emit(node: _Trie, start: str, first: bool) -> None:
-        # Unconstrained children first, so a shared prefix claims the original window name.
-        children = sorted(node.children.values(), key=lambda c: c.edge.is_constrained)
-        for child in children:
-            edge = child.edge
-            name = unique(edge.name, edge)
-            if edge.is_end_rooted:
-                start_str, end_str = edge.start_str(), start
-            else:
-                start_str, end_str = start, edge.end_str()
+    for branch in normalized_branches:
+        # The label branch claims the original window names. A condition branch is named for its last window
+        # (``<window>_criteria`` when the label branch already has that name), and the copies of the windows
+        # leading to it are prefixed with that name.
+        terminal = branch.terminal
+        if branch.is_label_branch:
+            names = [unique(edge.name) for edge in branch.edges]
+        else:
+            last = terminal.name
+            if last in windows and terminal.is_constrained:
+                last = f"{last}_criteria"
+            last = unique(last)
+            names = [unique(f"{last}__{edge.name}") for edge in branch.edges[:-1]] + [last]
+        start = "trigger"
+        for i, (name, edge) in enumerate(zip(names, branch.edges, strict=True)):
+            start_str, end_str = (edge.start_str(), start) if edge.is_end_rooted else (start, edge.end_str())
             windows[name] = WindowConfig(
                 start=start_str,
                 end=end_str,
@@ -854,11 +849,9 @@ def normalize(
                 end_inclusive=edge.bound.right_inclusive,
                 has={p: f"({lo}, {hi})" for p, (lo, hi) in edge.constraints},
                 label=edge.label,
-                index_timestamp="start" if first and child.on_label_path else None,
+                index_timestamp="start" if i == 0 and branch.is_label_branch else None,
             )
-            emit(child, f"{name}.{edge.exit_side}", False)
-
-    emit(trie, "trigger", True)
+            start = f"{name}.{edge.exit_side}"
 
     predicates: dict[str, Any] = copy.deepcopy(task_cfg.predicates)
     if index_predicate in predicates:

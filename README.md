@@ -119,8 +119,9 @@ True
 ### The normal form
 
 `normalize` discards what happens before the prediction time (it selects the cohort, but cannot change the
-label of a row in it) and pulls every criterion onto its own *branch* from the prediction time. What remains is
-a *label branch* with no criteria, and *criteria branches* that condition it. It also makes explicit that the
+label of a row in it) and pulls every criterion onto its own *branch* from the prediction time: a chain of
+windows ending in either the label or one window of criteria. What remains is a *label branch* with no
+criteria, and *criteria branches* that condition it. It also makes explicit that the
 hospitalization must end: ACES silently drops rows whose `start -> discharge` window never closes.
 
 ```python
@@ -136,17 +137,19 @@ hospitalization_bounding_event: start -> discharge (discharge: (1, None))
 
 ```
 
-The result is itself an ACES configuration, triggered at the prediction time, in which branches share their
-common prefixes:
+The result is itself an ACES configuration, triggered at the prediction time, whose window tree is exactly
+those branches: each hangs off the prediction time as a separate chain (copying any windows it has in common
+with another branch), so no window has more than one child.
 
 ```python
 >>> print_ACES(normalized)
 trigger; **Prediction Time**
 ├── (next discharge) hospitalization.end
-│   ├── (+1 day, 0:00:00) gap.end
-│   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-│   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
+│   └── (+1 day, 0:00:00) gap.end
+│       └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
 ├── (next discharge) hospitalization_criteria.end (no death)
+├── (next discharge) gap_criteria__hospitalization.end
+│   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
 └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 
 ```
