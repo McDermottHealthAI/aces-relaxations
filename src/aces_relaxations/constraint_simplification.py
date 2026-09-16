@@ -5,14 +5,14 @@ Many downstream query languages cannot express arbitrary count ranges; they can 
 *ever* occurs in a region, or assert that it *never* does. This module maps every constraint onto one of three
 targets, controlled by a small set of rules and cutoffs:
 
-| Original constraint      | Meaning              | Default target | Soundness of the default              |
-| ------------------------ | -------------------- | -------------- | ------------------------------------- |
-| ``(None, 0)`` / ``(0, 0)`` | never                | ``never``      | exact                                 |
-| ``(1, None)``            | at least once        | ``ever``       | exact                                 |
-| ``(k, None)``, ``k > 1`` | at least ``k`` times | ``ever``       | weakening (accepts a superset)        |
-| ``(k, m)``, ``k >= 1``   | between ``k``-``m``  | ``ever``       | weakening (accepts a superset)        |
-| ``(None, m)``, ``m > 0`` | at most ``m`` times  | ``null``       | weakening (constraint dropped)        |
-| ``(None, None)``         | unconstrained        | ``null``       | exact                                 |
+| Original constraint        | Meaning                    | Default target | Soundness of the default       |
+| -------------------------- | -------------------------- | -------------- | ------------------------------ |
+| ``(None, 0)`` / ``(0, 0)`` | never                      | ``never``      | exact                          |
+| ``(1, None)``              | at least once              | ``ever``       | exact                          |
+| ``(k, None)``, ``k > 1``   | at least ``k`` times       | ``ever``       | weakening (accepts a superset) |
+| ``(k, m)``, ``k >= 1``     | between ``k`` and ``m``    | ``ever``       | weakening (accepts a superset) |
+| ``(None, m)``, ``m > 0``   | at most ``m`` times        | ``null``       | weakening (constraint dropped) |
+| ``(None, None)``           | unconstrained              | ``null``       | exact                          |
 
 Two cutoffs adjust the defaults:
 
@@ -30,6 +30,8 @@ from enum import StrEnum
 from typing import Any
 
 from aces.config import TaskExtractorConfig
+
+from .tree import constraint_node_name
 
 Constraint = tuple[int | None, int | None]
 
@@ -242,7 +244,7 @@ def simplify_constraints(
         ValueError: If both ``rules`` and ``rule_kwargs`` are given.
 
     Examples:
-        >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
+        >>> from aces.config import EventConfig, PlainPredicateConfig
         >>> predicates = {"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")}
         >>> def make_cfg():
         ...     return TaskExtractorConfig(
@@ -327,8 +329,7 @@ def simplify_constraints(
         window.has.clear()
         window.has.update(new_has)
 
-        constrained_side = "start" if window.root_node == "end" else "end"
-        node = task_cfg.window_nodes.get(f"{name}.{constrained_side}")
+        node = task_cfg.window_nodes.get(constraint_node_name(name, window))
         if node is not None:
             node.constraints = window.has
 

@@ -17,138 +17,20 @@ when it re-roots the configuration at the prediction time.
 """
 
 from contextlib import redirect_stdout
-from datetime import timedelta
 from io import StringIO
 
 from aces.config import TaskExtractorConfig
 from aces.types import TemporalWindowBounds, ToEventWindowBounds
-from bigtree import Node, print_tree
+from bigtree import print_tree
 
-from .guarantees import PathState, anchor_counts
-from .predicates import predicate_expr
-from .tree import WindowNode, label_node, prediction_time_node, resolve_node
-
-
-def backward_edge_reason(node: Node) -> str | None:
-    """Explains why the edge into ``node`` from its parent can move backward in time, if it can.
-
-    Args:
-        node: A node in an ACES window tree.
-
-    Returns:
-        A human-readable reason if the edge can move backward in time, otherwise ``None``. The root (with no
-        ``endpoint_expr``) never moves backward.
-
-    Examples:
-        >>> from bigtree import Node
-        >>> print(backward_edge_reason(Node("trigger")))
-        None
-        >>> print(backward_edge_reason(
-        ...     Node("a", endpoint_expr=TemporalWindowBounds(True, timedelta(days=1), True, None))
-        ... ))
-        None
-        >>> print(backward_edge_reason(
-        ...     Node("a", endpoint_expr=TemporalWindowBounds(True, timedelta(days=-1), True, None))
-        ... ))
-        temporal bound -1 day, 0:00:00 is negative
-        >>> bound = TemporalWindowBounds(True, timedelta(days=1), True, timedelta(days=-2))
-        >>> print(backward_edge_reason(Node("a", endpoint_expr=bound)))
-        temporal offset -2 days, 0:00:00 is negative
-        >>> bound = ToEventWindowBounds(True, "death", True, None)
-        >>> print(backward_edge_reason(Node("a", endpoint_expr=bound)))
-        None
-        >>> bound = ToEventWindowBounds(True, "-death", True, None)
-        >>> print(backward_edge_reason(Node("a", endpoint_expr=bound)))
-        event bound targets the prior 'death' event
-        >>> print(backward_edge_reason(
-        ...     Node("a", endpoint_expr=ToEventWindowBounds(True, "-_RECORD_START", True, None))
-        ... ))
-        event bound targets the start of the record
-        >>> print(backward_edge_reason(
-        ...     Node("a", endpoint_expr=ToEventWindowBounds(True, "death", True, timedelta(hours=-1)))
-        ... ))
-        event offset -1 day, 23:00:00 is negative
-        >>> backward_edge_reason(Node("a", endpoint_expr="foo"))
-        Traceback (most recent call last):
-            ...
-        ValueError: Unexpected type <class 'str'> for endpoint expr: foo.
-    """
-    match getattr(node, "endpoint_expr", None):
-        case None:
-            return None
-        case TemporalWindowBounds() as time_bound:
-            if time_bound.window_size < timedelta(0):
-                return f"temporal bound {time_bound.window_size} is negative"
-            if time_bound.offset is not None and time_bound.offset < timedelta(0):
-                return f"temporal offset {time_bound.offset} is negative"
-            return None
-        case ToEventWindowBounds() as event_bound:
-            if event_bound.end_event == "-_RECORD_START":
-                return "event bound targets the start of the record"
-            if event_bound.end_event.startswith("-"):
-                return f"event bound targets the prior '{event_bound.end_event[1:]}' event"
-            if event_bound.offset is not None and event_bound.offset < timedelta(0):
-                return f"event offset {event_bound.offset} is negative"
-            return None
-        case _ as other:
-            raise ValueError(f"Unexpected type {type(other)} for endpoint expr: {other}.")
-
-
-def _implies(task_cfg: TaskExtractorConfig):
-    """``implies(g, p)``: an occurrence of predicate ``g`` is also an occurrence of predicate ``p``.
-
-    Examples:
-        >>> from aces.config import DerivedPredicateConfig, EventConfig, PlainPredicateConfig, WindowConfig
-        >>> cfg = TaskExtractorConfig(
-        ...     predicates={
-        ...         "a": PlainPredicateConfig("A"),
-        ...         "b": PlainPredicateConfig("B"),
-        ...         "ab": DerivedPredicateConfig("and(a, b)"),
-        ...         "a_or_b": DerivedPredicateConfig("or(a, b)"),
-        ...     },
-        ...     trigger=EventConfig("a"),
-        ...     windows={"w": WindowConfig("trigger", "start + 1d", True, True)},
-        ... )
-        >>> implies = _implies(cfg)
-        >>> implies("a", "a"), implies("a", "a_or_b"), implies("a_or_b", "a")
-        (True, True, False)
-
-    A co-occurrence implies each of its parts, but nothing implies a co-occurrence (except itself):
-
-        >>> implies("ab", "a"), implies("a", "ab"), implies("ab", "ab")
-        (True, False, True)
-    """
-
-    def implies(g: str, p: str) -> bool:
-        if g == p:
-            return True
-        g_expr, p_expr = predicate_expr(task_cfg, g), predicate_expr(task_cfg, p)
-        if not p_expr.is_or_only:
-            return False
-        if g_expr.op == "and":
-            return bool(g_expr.leaves & p_expr.leaves)
-        return g_expr.leaves <= p_expr.leaves
-
-    return implies
-
-
-def _initial_state(task_cfg: TaskExtractorConfig, pt: Node) -> PathState:
-    """A path state at the prediction time.
-
-    If the prediction time is the trigger, or is itself the occurrence of an event (the endpoint of a ``-> P``
-    or ``<- P`` bound), that event is known to occur exactly at the prediction time, which lets an inclusive
-    look-back to it resolve to the prediction time itself. Likewise, if the prediction time is the start of
-    the record, windows bounded by the record start begin at the prediction time.
-    """
-    state = PathState(_implies(task_cfg))
-    bound = getattr(pt, "endpoint_expr", None)
-    if pt.node_name == "trigger":
-        state.guarantee_at_prediction_time(task_cfg.trigger.predicate)
-    elif isinstance(bound, ToEventWindowBounds):
-        event = bound.end_event.lstrip("-")
-        if event != "_RECORD_END":
-            state.guarantee_at_prediction_time(event)
-    return state
+from .guarantees import PathState
+from .tree import (
+    backward_edge_reason,
+    endpoint_node,
+    label_node,
+    prediction_time_node,
+    search_includes_anchor,
+)
 
 
 def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
@@ -245,28 +127,27 @@ def future_only_violations(task_cfg: TaskExtractorConfig) -> list[str]:
     if violations:
         return list(violations)
 
-    pt = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
-    label_end = task_cfg.window_nodes[label_node(task_cfg).node_name]
-    label_start_ref = resolve_node(task_cfg, root_node=WindowNode(task_cfg.label_window, "start"))
-    label_start = task_cfg.window_nodes[label_start_ref.node_name]
-
-    for side, node in (("end", label_end), ("start", label_start)):
+    pt = prediction_time_node(task_cfg)
+    label_ends = (
+        ("end", label_node(task_cfg)),
+        ("start", endpoint_node(task_cfg, task_cfg.label_window, "start")),
+    )
+    for label_side, node in label_ends:
         if node is not pt and pt not in node.ancestors:
             violations[
                 f"The prediction time window node ({pt.node_name}) is not an ancestor of the label window "
-                f"{side} node ({node.node_name})."
+                f"{label_side} node ({node.node_name})."
             ] = None
             continue
 
         path = list(node.node_path)
-        state = _initial_state(task_cfg, pt)
+        state = PathState.at(task_cfg, pt)
         for step in path[path.index(pt) + 1 :]:
             bound = step.endpoint_expr
             reason = backward_edge_reason(step)
             before = state.pos
             window_name, side = step.node_name.rsplit(".", 1)
-            window = task_cfg.windows[window_name]
-            counts = anchor_counts(window.start_inclusive, window.end_inclusive, side)
+            counts = search_includes_anchor(task_cfg.windows[window_name], side)
             criteria = getattr(step, "constraints", None) or {}
             if reason is None:
                 if isinstance(bound, TemporalWindowBounds):

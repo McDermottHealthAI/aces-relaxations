@@ -1,4 +1,4 @@
-"""Normalized form for future-only ACES task configurations.
+"""The normalized form of a future-only ACES task configuration.
 
 A future-only task configuration describes, from the prediction time onward, a *target* (the label window)
 and a set of *conditions* (inclusion / exclusion criteria on windows, and the requirement that event-bounded
@@ -6,230 +6,73 @@ windows be realizable). ACES lets these be tangled together: a single window can
 the parent of the label window, and criteria can sit anywhere along a chain. The **normalized form** untangles
 them without changing the label of any prediction-time row:
 
-0. Every event-bounded window is given an explicit criterion that its bounding event occurs
-   (``aces_relaxations.bounding_events.require_bounding_events``), so that nothing downstream has to know
-   that ACES drops rows whose event-bounded windows cannot be realized.
-1. The tree is re-rooted at the prediction time; everything before it (the trigger, input-window criteria) is
-   discarded, since it selects the cohort but cannot change the label of a row that is in it.
-2. Every window that carries criteria is pulled out into its own *branch*: a chain of unconstrained copies of
+1. Every event-bounded window is given an explicit criterion that its bounding event occurs
+   ([`require_bounding_events`][aces_relaxations.bounding_events.require_bounding_events]), so that nothing
+   downstream has to know that ACES drops rows whose event-bounded windows cannot be realized.
+2. The tree is re-rooted at the prediction time. Everything before it (the trigger, input-window criteria,
+   look-back windows) selects the cohort but cannot change the label of a row in it, so it is discarded;
+   branches that start by moving backward from the prediction time are discarded with a warning.
+3. Every window that carries criteria is pulled out into its own *branch*: a chain of unconstrained copies of
    the windows leading to it, ending in the constrained window. The label window's branch carries no
-   criteria (any criteria it had are pulled out likewise), and unconstrained event-bounded leaf windows are
-   kept as branches of their own, because ACES drops rows whose event-bounded windows cannot be realized.
-3. Along each branch, runs of unconstrained, unlabeled, temporal windows are collapsed into one window.
-4. Branches sharing an identical unconstrained prefix share those windows, so the result is again a tree, in
-   which every root-to-leaf path is a chain of windows whose ``start`` is the previous window's ``end`` and
-   whose criteria (if any) sit only on its last window.
+   criteria, and unconstrained event-bounded leaf windows are kept as branches of their own.
+4. Along each branch, runs of unconstrained, unlabeled windows whose composition is a single window collapse
+   into it: two temporal windows into one, and a window followed by a hop to the next ``Q`` into one hop
+   whenever ``Q`` is provably absent wherever the longer search would additionally look. A hop that lands
+   where it starts drops out of the chain.
+5. Redundant criteria and branches are removed (see ``aces_relaxations.redundancy``).
+6. Branches sharing an unconstrained prefix share those windows, so the result is again a tree, in which
+   every root-to-leaf path is a chain of windows whose ``start`` is the previous window's exit and whose
+   criteria (if any) sit only on its last window.
 
-The result is a genuine ACES configuration whose trigger is a synthetic *index event* predicate marking the
-prediction time, so it can be run through ACES itself (see ``aces_relaxations.extraction``), and whose
-branches are exposed for downstream converters.
+Windows defined backward from a later endpoint (``start: end - 1d``) are rewritten as forward chains when the
+temporal windows before them cover the look-back (the *strict* form). The *universal* form
+(``allow_end_rooted=True``) additionally keeps a look-back end-rooted when no forward rewrite exists but it is
+guaranteed not to reach before the prediction time (see ``aces_relaxations.guarantees``).
 
-Windows defined backward from a later endpoint (``start: end - 1d``) are allowed when they cannot reach before
-the prediction time, i.e. when the guaranteed elapsed time along the path (the sum of the temporal windows
-on it; event-bounded windows guarantee nothing) covers the look-back; they are rewritten as forward chains.
-
-Why this is label-preserving: with every edge in the prediction-time subtree moving forward in time, the
-timestamp of every window endpoint is a deterministic function of the data and the prediction time, computed
-along its path from the root. Copying a path therefore realizes exactly the same endpoints, so a criterion
-evaluated on a copy has exactly the same truth value, and the conjunction of criteria across branches equals
-the original conjunction. Merging two adjacent unconstrained temporal windows ``(a, b]`` and ``(b, c]``
-into ``(a, c]`` changes no endpoint that anything downstream refers to (only ``a`` and ``c`` are referenced),
-and the merged window is itself unconstrained. See the README for the property test that checks this against
-ACES on random configurations and data.
+Why this is label-preserving: with every edge after the prediction time moving forward in time (or looking
+back by a guaranteed-safe amount), the timestamp of every window endpoint is a deterministic function of the
+data and the prediction time, computed along its path from the root. Copying a path therefore realizes exactly
+the same endpoints, so a criterion evaluated on a copy has exactly the same truth value, and the conjunction
+of criteria across branches equals the original conjunction. Each merge and removal is justified where it is
+made. The property tests check the whole against ACES on random configurations and data.
 """
 
 import copy
 import logging
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
 from aces.config import EventConfig, PlainPredicateConfig, TaskExtractorConfig, WindowConfig
-from aces.types import TemporalWindowBounds, ToEventWindowBounds
+from aces.types import END_OF_RECORD_KEY, TemporalWindowBounds, ToEventWindowBounds
 from bigtree import Node
 
 from .bounding_events import require_bounding_events
-from .degeneracy import Analysis, Interval
-from .future_only import _implies, _initial_state, backward_edge_reason, validate_future_only
-from .guarantees import PathState, anchor_counts
-from .tree import prediction_time_node
+from .branches import Branch, Edge, bound_key, render_timedelta
+from .degeneracy import Analysis
+from .future_only import validate_future_only
+from .guarantees import PathState
+from .ordering import Interval
+from .predicates import implication
+from .redundancy import remove_redundancy
+from .tree import backward_edge_reason, constraint_node_name, prediction_time_node, search_includes_anchor
 
 logger = logging.getLogger(__name__)
 
 INDEX_PREDICATE = "index_event"
 INDEX_CODE = "_INDEX_EVENT_"
-RECORD_END = "_RECORD_END"
-
-Constraint = tuple[int | None, int | None]
-Bound = TemporalWindowBounds | ToEventWindowBounds
 
 
-def _bound_key(bound: Bound) -> tuple:
-    """A hashable summary of a bound, sufficient to decide whether two windows coincide.
-
-    The ``offset`` field of ACES bounds is deliberately ignored: ACES uses it as scratch state during
-    extraction (and accumulates into it on every query), so it carries no meaning about the window.
-    """
-    if isinstance(bound, TemporalWindowBounds):
-        return ("time", bound.left_inclusive, bound.right_inclusive, bound.window_size)
-    return ("event", bound.left_inclusive, bound.right_inclusive, bound.end_event)
-
-
-@dataclass(frozen=True, eq=False)
-class Edge:
-    """One window of a normalized branch: how its end is reached from its start, and what it asserts.
-
-    Attributes:
-        name: The window name.
-        bound: How the end is reached from the start (a forward temporal offset or the next matching event),
-            including the inclusivity of both endpoints.
-        constraints: The window's criteria, as sorted ``(predicate, (min, max))`` pairs.
-        label: The label predicate, if this is the label window.
-
-    Examples:
-        >>> edge = Edge("gap", TemporalWindowBounds(False, timedelta(days=1), True), (("death", (None, 0)),))
-        >>> edge.is_temporal, edge.is_constrained, edge.days
-        (True, True, 1.0)
-        >>> print(edge)
-        gap: start + 1 day (death: (None, 0))
-        >>> print(edge.unconstrained())
-        gap: start + 1 day
-        >>> print(Edge("target", ToEventWindowBounds(False, "discharge", True), label="death"))
-        target: start -> discharge; label=death
-        >>> print(Edge("tail", ToEventWindowBounds(True, "_RECORD_END", True)))
-        tail: start -> end of record
-        >>> back = Edge("last_day", TemporalWindowBounds(False, timedelta(days=-1), True), label="death")
-        >>> back.is_end_rooted, back.exit_side, back.days
-        (True, 'start', -1.0)
-        >>> print(back)
-        last_day: end - 1 day; label=death
-        >>> print(Edge("since", ToEventWindowBounds(False, "-admission", True)))
-        since: end <- admission
-    """
-
-    name: str
-    bound: Bound
-    constraints: tuple[tuple[str, Constraint], ...] = ()
-    label: str | None = None
-
-    @property
-    def is_temporal(self) -> bool:
-        """Whether the window is a fixed offset (forward or backward)."""
-        return isinstance(self.bound, TemporalWindowBounds)
-
-    @property
-    def is_end_rooted(self) -> bool:
-        """Whether the window is defined from its end backward to its start (a look-back)."""
-        if self.is_temporal:
-            return self.bound.window_size < timedelta(0)
-        return self.bound.end_event.startswith("-")
-
-    @property
-    def exit_side(self) -> str:
-        """The endpoint the next window in the chain attaches to."""
-        return "start" if self.is_end_rooted else "end"
-
-    @property
-    def is_constrained(self) -> bool:
-        """Whether the window carries criteria."""
-        return bool(self.constraints)
-
-    @property
-    def days(self) -> float | None:
-        """The window's duration in days, for temporal windows (negative for look-backs)."""
-        if not self.is_temporal:
-            return None
-        return self.bound.window_size.total_seconds() / 86400
-
-    @property
-    def event(self) -> str | None:
-        """The predicate bounding the window, for event-bounded windows (without the look-back sign)."""
-        return None if self.is_temporal else self.bound.end_event.lstrip("-")
-
-    def unconstrained(self) -> "Edge":
-        """A copy without criteria."""
-        return replace(self, constraints=())
-
-    @property
-    def key(self) -> tuple:
-        """A hashable identity: name, bound, criteria, and label."""
-        return (self.name, _bound_key(self.bound), self.constraints, self.label)
-
-    def __eq__(self, other: object) -> bool:
-        """Edges are equal when their identities are."""
-        return isinstance(other, Edge) and self.key == other.key
-
-    def __hash__(self) -> int:
-        """Hashes the identity."""
-        return hash(self.key)
-
-    def end_str(self) -> str | None:
-        """The window's ``end`` in ACES syntax for a forward window (``None`` for "end of record")."""
-        if self.is_temporal:
-            return f"start + {_render_timedelta(self.bound.window_size)}"
-        if self.event == RECORD_END:
-            return None
-        return f"start -> {self.event}"
-
-    def start_str(self) -> str:
-        """The window's ``start`` in ACES syntax for an end-rooted window."""
-        if self.is_temporal:
-            return f"end - {_render_timedelta(-self.bound.window_size)}"
-        return f"end <- {self.event}"
-
-    def __str__(self) -> str:
-        """Renders the edge in ACES-like syntax."""
-        end = self.start_str() if self.is_end_rooted else (self.end_str() or "start -> end of record")
-        parts = [f"{self.name}: {end}"]
-        if self.constraints:
-            parts.append(f" ({_constraints_str(dict(self.constraints))})")
-        if self.label:
-            parts.append(f"; label={self.label}")
-        return "".join(parts)
-
-
-@dataclass(frozen=True)
-class Branch:
-    """A chain of windows from the prediction time, whose criteria (if any) sit only on its last window.
-
-    Examples:
-        >>> gap = Edge("gap", TemporalWindowBounds(False, timedelta(days=1), True))
-        >>> target = Edge("target", ToEventWindowBounds(False, "discharge", True), label="death")
-        >>> branch = Branch((gap, target))
-        >>> print(branch)
-        gap: start + 1 day -> target: start -> discharge; label=death
-        >>> branch.is_label_branch, branch.is_criteria_branch, branch.terminal.name
-        (True, False, 'target')
-    """
-
-    edges: tuple[Edge, ...]
-
-    @property
-    def terminal(self) -> Edge:
-        """The last window of the branch."""
-        return self.edges[-1]
-
-    @property
-    def is_label_branch(self) -> bool:
-        """Whether the branch ends in the label window."""
-        return self.terminal.label is not None
-
-    @property
-    def is_criteria_branch(self) -> bool:
-        """Whether the branch ends in a constrained window."""
-        return self.terminal.is_constrained
-
-    def __str__(self) -> str:
-        """Renders the chain."""
-        return " -> ".join(str(e) for e in self.edges)
-
-
+@dataclass
 class NormalizedTaskConfig(TaskExtractorConfig):
     """A task configuration in normalized form.
 
-    This is a genuine ACES configuration (its trigger is the synthetic index-event predicate), with the
-    normalized branches exposed on ``branches``.
+    This is a genuine ACES configuration (its trigger is the synthetic index-event predicate marking the
+    prediction time), with the normalized branches it was built from exposed on ``branches``.
+
+    Attributes:
+        branches: The normalized branches, label branch first.
     """
 
     branches: tuple[Branch, ...] = ()
@@ -243,38 +86,6 @@ class NormalizedTaskConfig(TaskExtractorConfig):
     def criteria_branches(self) -> tuple[Branch, ...]:
         """The branches ending in a constrained window, plus unconstrained realizability branches."""
         return tuple(b for b in self.branches if not b.is_label_branch)
-
-
-def _render_timedelta(delta: timedelta) -> str:
-    """Renders a positive timedelta in a form ACES's boundary parser accepts.
-
-    Examples:
-        >>> _render_timedelta(timedelta(days=7))
-        '7 days'
-        >>> _render_timedelta(timedelta(hours=36))
-        '36 hours'
-        >>> _render_timedelta(timedelta(minutes=90))
-        '90 minutes'
-        >>> _render_timedelta(timedelta(seconds=61))
-        '61 seconds'
-        >>> _render_timedelta(timedelta(hours=1))
-        '1 hour'
-    """
-    seconds = round(delta.total_seconds())
-    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
-        if seconds % size == 0:
-            n = seconds // size
-            return f"{n} {unit}{'' if n == 1 else 's'}"
-    raise ValueError(f"Cannot render {delta}.")  # pragma: no cover
-
-
-def _constraints_str(constraints: Mapping[str, Constraint]) -> str:
-    return ", ".join(f"{p}: ({lo}, {hi})" for p, (lo, hi) in constraints.items())
-
-
-def _own_node_name(window_name: str, window: WindowConfig) -> str:
-    """The name of the node that carries a window's criteria and label (the far end of its span)."""
-    return f"{window_name}.{'start' if window.root_node == 'end' else 'end'}"
 
 
 def _rewind(stack: list[Edge], days: timedelta, window_name: str) -> list[Edge]:
@@ -306,13 +117,13 @@ def _rewind(stack: list[Edge], days: timedelta, window_name: str) -> list[Edge]:
     while remaining > timedelta(0):
         if not out:
             raise ValueError(
-                f"Window '{window_name}' looks back {_render_timedelta(days)}, reaching before the "
+                f"Window '{window_name}' looks back {render_timedelta(days)}, reaching before the "
                 "prediction time."
             )
         top = out.pop()
         if not top.is_temporal or top.is_end_rooted:
             raise ValueError(
-                f"Window '{window_name}' looks back {_render_timedelta(days)} across the event-bounded "
+                f"Window '{window_name}' looks back {render_timedelta(days)} across the event-bounded "
                 f"window '{top.name}', so it cannot be written as a start-rooted chain."
             )
         if top.bound.window_size > remaining:
@@ -361,13 +172,13 @@ def _walk(
         week__pre_last_day: start + 6 days -> after: start + 2 days (B: (None, 0))
     """
     label_window = task_cfg.label_window
-    label_own = _own_node_name(label_window, task_cfg.windows[label_window])
+    label_own = constraint_node_name(label_window, task_cfg.windows[label_window])
     label = task_cfg.windows[label_window].label
 
     path = list(leaf.node_path)
     steps = path[path.index(root) + 1 :]
     stack: list[Edge] = []
-    state = _initial_state(task_cfg, root)
+    state = PathState.at(task_cfg, root)
 
     def emit(edge: Edge, is_leaf: bool) -> Iterator[Branch]:
         if edge.is_constrained:
@@ -378,7 +189,8 @@ def _walk(
     for i, node in enumerate(steps):
         window_name, side = node.node_name.rsplit(".", 1)
         window = task_cfg.windows[window_name]
-        is_own = node.node_name == _own_node_name(window_name, window)
+        is_own = node.node_name == constraint_node_name(window_name, window)
+        name = window_name if is_own else f"{window_name}_{side}_gap"
         raw_constraints = getattr(node, "constraints", None) or {}
         constraints = tuple(sorted((p, tuple(c)) for p, c in raw_constraints.items()))
         node_label = label if node.node_name == label_own else None
@@ -386,9 +198,8 @@ def _walk(
         bound = node.endpoint_expr
         before = state.pos
 
-        counts = anchor_counts(window.start_inclusive, window.end_inclusive, side)
+        counts = search_includes_anchor(window, side)
         if backward_edge_reason(node) is None:
-            name = window_name if is_own else f"{window_name}_{side}_gap"
             edge = Edge(name, bound, constraints, node_label)
             if _is_identity_hop(state, edge, counts):
                 # The search finds the event at the current position, so the chain does not move: the
@@ -441,7 +252,7 @@ def _walk(
             state.look_back_event(guarantee)
 
         # Kept end-rooted: the window's own node carries its criteria; a gap node carries nothing.
-        edge = Edge(window_name if is_own else f"{window_name}_{side}_gap", bound, constraints, node_label)
+        edge = Edge(name, bound, constraints, node_label)
         state.add_criteria(raw_constraints, state.pos, before)
         yield from emit(edge, is_leaf)
         stack.append(edge.unconstrained())
@@ -459,12 +270,10 @@ def _is_identity_hop(state: PathState, edge: Edge, counts: bool) -> bool:
         >>> _is_identity_hop(state, Edge("c", ToEventWindowBounds(False, "C", True)), counts=True)
         False
     """
-    if edge.is_temporal or edge.is_end_rooted or edge.event == RECORD_END or not counts:
+    if edge.is_temporal or edge.is_end_rooted or not counts:
         return False
     return any(
-        g.start == g.end == state.pos
-        and not g.predicate.startswith("_RECORD_")
-        and (edge.event == "_ANY_EVENT" or state.implies(g.predicate, edge.event))
+        g.interval == Interval.point(state.pos) and state.implies(g.predicate, edge.event)
         for g in state.guarantees
     )
 
@@ -472,7 +281,7 @@ def _is_identity_hop(state: PathState, edge: Edge, counts: bool) -> bool:
 def _edge_interval(analysis: Analysis, edge: Edge) -> Interval | None:
     """The interval of an edge that is one of the analyzed configuration's forward windows (else ``None``)."""
     node = analysis.task_cfg.window_nodes.get(f"{edge.name}.end")
-    if edge.is_end_rooted or node is None or _bound_key(node.endpoint_expr) != _bound_key(edge.bound):
+    if edge.is_end_rooted or node is None or bound_key(node.endpoint_expr) != bound_key(edge.bound):
         return None
     return analysis.window(edge.name)
 
@@ -493,12 +302,7 @@ def _forbidden(analysis: Analysis, predicate: str, region: Interval) -> bool:
         >>> _forbidden(analysis, "death", Interval(gap.lo, gap.lo, False, False))
         True
     """
-    if analysis.is_empty(region):
-        return True
-    return any(
-        b.at_most == 0 and analysis.implies(predicate, b.predicate) and analysis.contains(b.interval, region)
-        for b in analysis.bounds
-    )
+    return analysis.ordering.is_empty(region) or analysis.forbidden_over(predicate, region) is not None
 
 
 def _mergeable_hop(analysis: Analysis, prev: Edge, region: Interval, edge: Edge) -> bool | None:
@@ -522,15 +326,10 @@ def _mergeable_hop(analysis: Analysis, prev: Edge, region: Interval, edge: Edge)
         return None
     # A ``Q`` at the start is harmless when the previous hop, searching inclusively for something ``Q``
     # implies, would itself have stopped there, so that the original chain sees it too.
-    stops_there = (
-        not prev.is_temporal
-        and prev.bound.right_inclusive
-        and prev.event != RECORD_END
-        and analysis.implies(q, prev.event)
-    )
+    stops_there = not prev.is_temporal and prev.bound.right_inclusive and analysis.implies(q, prev.event)
     if stops_there or _forbidden(analysis, q, Interval.point(region.lo)):
         return inclusive
-    if not inclusive or analysis.leq(region.lo, region.hi, strict=True):
+    if not inclusive or analysis.ordering.leq(region.lo, region.hi, strict=True):
         return False
     return None
 
@@ -668,7 +467,7 @@ def _collapse(branch: Branch, analysis: Analysis | None = None) -> Branch:
             merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
             regions[-1] = _span(regions[-1], region)
             continue
-        if plain and not edge.is_temporal and edge.event != RECORD_END and regions[-1] is not None:
+        if plain and not edge.is_temporal and edge.event != END_OF_RECORD_KEY and regions[-1] is not None:
             inclusive = _mergeable_hop(analysis, prev, regions[-1], edge)
             if inclusive is not None:
                 bound = ToEventWindowBounds(prev.bound.left_inclusive, edge.event, inclusive)
@@ -694,10 +493,9 @@ class _Trie:
     def insert(self, branch: Branch) -> None:
         node = self
         for edge in branch.edges:
-            key = (_bound_key(edge.bound), edge.constraints, edge.label)
-            if key not in node.children:
-                node.children[key] = _Trie(edge)
-            node = node.children[key]
+            if edge.shape not in node.children:
+                node.children[edge.shape] = _Trie(edge)
+            node = node.children[edge.shape]
             node.on_label_path = node.on_label_path or branch.is_label_branch
 
 
@@ -715,13 +513,10 @@ def _future_leaves(task_cfg: TaskExtractorConfig, root: Node) -> list[Node]:
         reason = backward_edge_reason(child)
         if reason is not None:
             bound = child.endpoint_expr
-            window = task_cfg.windows[child.node_name.rsplit(".", 1)[0]]
-            side = child.node_name.rsplit(".", 1)[1]
+            window_name, side = child.node_name.rsplit(".", 1)
+            counts = search_includes_anchor(task_cfg.windows[window_name], side)
             guaranteed = isinstance(bound, ToEventWindowBounds) and (
-                _initial_state(task_cfg, root).guarantee_for(
-                    bound.end_event[1:], anchor_counts(window.start_inclusive, window.end_inclusive, side)
-                )
-                is not None
+                PathState.at(task_cfg, root).guarantee_for(bound.end_event[1:], counts) is not None
             )
             if not guaranteed:
                 logger.warning(
@@ -733,8 +528,8 @@ def _future_leaves(task_cfg: TaskExtractorConfig, root: Node) -> list[Node]:
     return leaves
 
 
-def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> tuple[Branch, ...]:
-    """Computes the normalized branches of a future-only task configuration, without building a config.
+def _branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> tuple[Branch, ...]:
+    """Computes the normalized branches of a future-only task configuration.
 
     Args:
         task_cfg: The task configuration.
@@ -750,23 +545,23 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
             start-rooted chain.
 
     Examples:
-        >>> for b in branches(in_hosp_mortality_cfg): print(b)
+        >>> for b in _branches(in_hosp_mortality_cfg): print(b)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         gap: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
         gap: start + 1 day -> target_bounding_event: start -> discharge_or_death (discharge_or_death: (1,
         None))
-        >>> for b in branches(post_discharge_mortality_cfg): print(b)
+        >>> for b in _branches(post_discharge_mortality_cfg): print(b)
         hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
         post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
         hospitalization: start -> discharge (death: (None, 0))
         hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
         hospitalization_bounding_event: start -> discharge (discharge: (1, None))
-        >>> for b in branches(readmission_cfg): print(b)
+        >>> for b in _branches(readmission_cfg): print(b)
         gap: start + 1 day -> target: start + 29 days; label=admission
         gap: start + 1 day (admission: (None, 0), death: (None, 0))
         gap: start + 1 day -> target: start + 29 days; label=admission -> censoring_protection: start ->
         end of record (_ANY_EVENT: (1, None))
-        >>> for b in branches(two_stage_cfg): print(b)
+        >>> for b in _branches(two_stage_cfg): print(b)
         1st_infusion: start -> infusion_end -> 2nd_infusion_start_gap: start -> infusion_start ->
         2nd_infusion: start -> infusion_end; label=adverse_event
         1st_infusion: start -> infusion_end (adverse_event: (None, 0), infusion_end: (1, None))
@@ -776,17 +571,15 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
     validate_future_only(task_cfg)
     task_cfg = require_bounding_events(task_cfg)
     analysis = Analysis.of(task_cfg)
-    root = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
+    root = prediction_time_node(task_cfg)
 
     seen: dict[Branch, None] = {}
     for leaf in _future_leaves(task_cfg, root):
         for branch in _walk(task_cfg, root, leaf, allow_end_rooted):
             seen[_collapse(branch, analysis)] = None
 
-    from .simplification import simplify_branches  # circular at module level
-
-    at_pt = [g.predicate for g in _initial_state(task_cfg, root).guarantees]
-    ordered = list(simplify_branches(seen, _implies(task_cfg), at_pt, task_cfg))
+    at_pt = [g.predicate for g in PathState.at(task_cfg, root).guarantees]
+    ordered = list(remove_redundancy(seen, implication(task_cfg), at_pt))
     return tuple(sorted(ordered, key=lambda b: (not b.is_label_branch, ordered.index(b))))
 
 
@@ -893,7 +686,7 @@ def normalize(
         └── (next A_or_B) either_criteria.end (at least 1 A_or_B)
 
     (``again``'s own "bounding event occurs" criterion was implied by ``either``'s landing, which
-    ``either_criteria`` asserts, and was removed; see ``aces_relaxations.simplification``.)
+    ``either_criteria`` asserts, and was removed; see ``aces_relaxations.redundancy``.)
 
     Windows defined backward from a later endpoint are fine as long as they cannot reach before the
     prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
@@ -1026,7 +819,7 @@ def normalize(
         ValueError: Window 'since_admission' looks back to a prior 'admission' event, which is not
         guaranteed to occur after the prediction time.
     """
-    normalized_branches = branches(task_cfg, allow_end_rooted)
+    normalized_branches = _branches(task_cfg, allow_end_rooted)
 
     trie = _Trie()
     for branch in normalized_branches:
@@ -1072,8 +865,9 @@ def normalize(
         raise ValueError(f"Predicate '{index_predicate}' already exists; choose another index_predicate.")
     predicates[index_predicate] = PlainPredicateConfig(index_code)
 
-    normalized = NormalizedTaskConfig(
-        predicates=predicates, trigger=EventConfig(index_predicate), windows=windows
+    return NormalizedTaskConfig(
+        predicates=predicates,
+        trigger=EventConfig(index_predicate),
+        windows=windows,
+        branches=normalized_branches,
     )
-    normalized.branches = normalized_branches
-    return normalized

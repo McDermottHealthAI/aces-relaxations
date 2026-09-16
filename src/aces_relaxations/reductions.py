@@ -1,23 +1,23 @@
-"""Model-agnostic reductions of a normalized task to the shapes reduced query languages accept.
+"""Reduce the label branch of a normalized task to a single window re-rooted at its own start.
 
-The per-model converters share two moves that belong here rather than in each of them:
+Many query languages can only ask about one window that starts at the prediction time: "does ``P`` occur
+within ``d`` days?", "before the next ``Q``?", "before the end of the record?". ``last_link_target`` makes the
+corresponding approximation: it assumes the model's prediction at the prediction time is as good as the
+prediction it would make at the start of the label window, drops every link of the label branch but the last,
+and re-roots that window at its own start. A look-back window is inverted into a forward one; this is always
+possible for a fixed look-back, and possible for a look-back to a prior event when the window's end was itself
+reached by an event hop.
 
-- **Keep only the target.** Assume the condition branches are independent of the target and drop them,
-  retaining only the label branch (``label_only``).
-- **Keep only the last link.** Assume the model's prediction at the prediction time is as good as the
-  prediction it would make at the start of the label window, and drop every link of the label branch but
-  the last, re-rooting that window at its own start (``last_link_target``). A look-back window is inverted
-  into a forward one; this is always possible for a fixed look-back, and possible for a look-back to a
-  prior event when the window's end was itself reached by an event hop.
-
-Both are approximations, and their justifications live with the converters that use them.
+Whether the approximation is justified for a given model is a question for the code that uses it. The
+condition branches (``NormalizedTaskConfig.criteria_branches``) are not touched: dropping them, too, is
+another model-specific approximation.
 """
 
 from dataclasses import dataclass
 
-from aces.types import TemporalWindowBounds, ToEventWindowBounds
+from aces.types import END_OF_RECORD_KEY
 
-from .normalization import RECORD_END, Branch, Edge, NormalizedTaskConfig
+from .normalization import NormalizedTaskConfig
 from .predicates import PredicateExpr, predicate_expr
 
 
@@ -74,48 +74,6 @@ class TargetWindow:
         return f"{self.label} {span} ({flags})"
 
 
-def label_only(normalized: NormalizedTaskConfig) -> Branch:
-    """Drops every condition branch, keeping the label branch alone.
-
-    This assumes the conditions are independent of the target, so that conditioning on them would not
-    change the target's distribution.
-
-    Examples:
-        >>> print(label_only(normalize(in_hosp_mortality_cfg)))
-        gap: start + 1 day -> target: start -> discharge_or_death; label=death
-    """
-    return normalized.label_branch
-
-
-def _forward_target(
-    edge: Edge, label: PredicateExpr, task_cfg: NormalizedTaskConfig, note: str
-) -> TargetWindow:
-    bound = edge.bound
-    if isinstance(bound, TemporalWindowBounds):
-        return TargetWindow(
-            label,
-            duration_days=edge.days,
-            start_inclusive=bound.left_inclusive,
-            end_inclusive=bound.right_inclusive,
-            note=note,
-        )
-    if bound.end_event == RECORD_END:
-        return TargetWindow(
-            label,
-            to_record_end=True,
-            start_inclusive=bound.left_inclusive,
-            end_inclusive=bound.right_inclusive,
-            note=note,
-        )
-    return TargetWindow(
-        label,
-        bounding_event=predicate_expr(task_cfg, bound.end_event),
-        start_inclusive=bound.left_inclusive,
-        end_inclusive=bound.right_inclusive,
-        note=note,
-    )
-
-
 def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
     """Reduces the label branch to its last window, re-rooted at that window's start.
 
@@ -146,7 +104,7 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
 
     A fixed look-back label window inverts exactly:
 
-        >>> from aces.config import EventConfig, PlainPredicateConfig, TaskExtractorConfig, WindowConfig
+        >>> from aces.config import EventConfig, PlainPredicateConfig, TaskExtractorConfig
         >>> predicates = {
         ...     "A": PlainPredicateConfig("A"),
         ...     "B": PlainPredicateConfig("B"),
@@ -226,45 +184,27 @@ def last_link_target(normalized: NormalizedTaskConfig) -> TargetWindow:
     branch = normalized.label_branch
     last = branch.terminal
     label = predicate_expr(normalized, last.label)
+    flags = {"start_inclusive": last.bound.left_inclusive, "end_inclusive": last.bound.right_inclusive}
 
-    if not last.is_end_rooted:
-        return _forward_target(last, label, normalized, "exact")
+    if last.is_temporal:
+        return TargetWindow(label, duration_days=abs(last.days), **flags)
 
-    bound = last.bound
-    if isinstance(bound, TemporalWindowBounds):
-        return TargetWindow(
-            label,
-            duration_days=-last.days,
-            start_inclusive=bound.left_inclusive,
-            end_inclusive=bound.right_inclusive,
-            note="exact",
-        )
+    end_event, note = last.event, "exact"
+    if last.is_end_rooted:
+        previous = branch.edges[-2] if len(branch.edges) > 1 else None
+        if previous is None or previous.is_temporal:
+            raise ValueError(
+                f"The label window '{last.name}' looks back to a prior {last.event} from an end reached by a "
+                "fixed offset, so it cannot be re-rooted at its start."
+            )
+        end_event = previous.event
+        if end_event != END_OF_RECORD_KEY:  # There is exactly one record end, so that case stays exact.
+            note = (
+                f"the window originally ran from the last {last.event} before a {end_event} to that "
+                f"{end_event}; re-rooted at the {last.event}, it runs to the next {end_event}, which is the "
+                f"same {end_event} only if no other {end_event} intervenes"
+            )
 
-    if len(branch.edges) < 2 or not isinstance(branch.edges[-2].bound, ToEventWindowBounds):
-        raise ValueError(
-            f"The label window '{last.name}' looks back to a prior {last.event} from an end reached by a "
-            "fixed offset, so it cannot be re-rooted at its start."
-        )
-    previous = branch.edges[-2]
-    end_event = previous.event
-    note = (
-        f"the window originally ran from the last {last.event} before a {end_event} to that {end_event}; "
-        f"re-rooted at the {last.event}, it runs to the next {end_event}, which is the same {end_event} "
-        "only if no other {end_event} intervenes"
-    ).replace("{end_event}", end_event)
-    if end_event == RECORD_END:
-        # There is exactly one record end, so re-rooting at the last event before it is exact.
-        return TargetWindow(
-            label,
-            to_record_end=True,
-            start_inclusive=bound.left_inclusive,
-            end_inclusive=bound.right_inclusive,
-            note="exact",
-        )
-    return TargetWindow(
-        label,
-        bounding_event=predicate_expr(normalized, end_event),
-        start_inclusive=bound.left_inclusive,
-        end_inclusive=bound.right_inclusive,
-        note=note,
-    )
+    if end_event == END_OF_RECORD_KEY:
+        return TargetWindow(label, to_record_end=True, note=note, **flags)
+    return TargetWindow(label, bounding_event=predicate_expr(normalized, end_event), note=note, **flags)

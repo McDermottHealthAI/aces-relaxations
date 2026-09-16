@@ -2,17 +2,18 @@
 
 The normalized form pulls every criterion onto its own branch, which can leave criteria that other parts of
 the configuration already imply, and branches that assert nothing. This pass proves such redundancy with the
-same symbolic bookkeeping as ``degeneracy``, applied to the branches themselves (positions along a branch are
-offsets from anchors; identical searches from identical positions share an anchor, so branches sharing a
-prefix share positions), and removes:
+same symbolic bookkeeping as ``degeneracy`` (see ``aces_relaxations.ordering``), applied to the branches
+themselves (positions along a branch are offsets from anchors; identical searches from identical positions
+share an anchor, so branches sharing a prefix share positions), and removes:
 
 - **Same-region criteria windows.** Constrained windows with the same prefix and the same bound are one
   window whose criteria are the conjunction (the largest lower bound and the smallest upper bound of each
   predicate).
 - **Implied criteria.** An upper bound of ``k`` on ``P`` over a window is implied by an upper bound of at
-  most ``k`` on a predicate ``P`` implies, over a window containing it, or by a hop's gap (no ``P'`` strictly
-  between a search's start and the event it finds). A lower bound of ``k`` on ``P`` is implied by a lower
-  bound of at least ``k`` on a predicate implying ``P`` over a window inside it, or (for ``k = 1``) by an
+  most ``k`` on ``P`` (or of 0 on a predicate ``P`` implies) over a window containing it, or by a hop's gap
+  (no ``P'`` strictly between a search's start and the event it finds). A lower bound of ``k`` on ``P`` is
+  implied by a lower bound of at least ``k`` on ``P`` (or, for ``k = 1``, of at least 1 on a predicate
+  implying ``P``) over a window inside it, or (for ``k = 1``) by an
   occurrence guaranteed inside it: the event at the prediction time, or the event a hop landed on *whose
   landing some other surviving criterion explicitly asserts* (a lower bound on an implying predicate over
   a window within the search's range and ending no later than the landing). A hop's landing is only a fact
@@ -30,12 +31,20 @@ labels; the property tests check this against ACES.
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 
-from aces.config import TaskExtractorConfig
+from aces.types import END_OF_RECORD_KEY, START_OF_RECORD_KEY
 
-from .degeneracy import BOTTOM, RECORD_START, TOP, Analysis, Anchor, CountBound, Interval, Position
-from .normalization import RECORD_END, Branch, Edge, _bound_key
-
-Constraint = tuple[int | None, int | None]
+from .branches import Branch, Constraint, Edge
+from .ordering import (
+    RECORD_END_ANCHOR,
+    RECORD_START_ANCHOR,
+    ROOT,
+    Anchor,
+    CountBound,
+    Interval,
+    Ordering,
+    Position,
+    transferable_count,
+)
 
 
 @dataclass
@@ -54,7 +63,7 @@ class _Landing:
 class _Space:
     """Positions and facts over a set of branches."""
 
-    analysis: Analysis
+    ordering: Ordering = field(default_factory=Ordering)
     landings: list[_Landing] = field(default_factory=list)
     gaps: list[CountBound] = field(default_factory=list)
     _paths: dict[tuple, list[Position]] = field(default_factory=dict)
@@ -62,10 +71,10 @@ class _Space:
     def path(self, edges: Iterable[Edge]) -> list[Position]:
         """The positions before and after each edge (identical prefixes get identical positions)."""
         edges = tuple(edges)
-        key = tuple((_bound_key(e.bound), e.constraints, e.label) for e in edges)
+        key = tuple(e.shape for e in edges)
         if key in self._paths:
             return self._paths[key]
-        positions = [Position(0)] if not edges else list(self.path(edges[:-1]))
+        positions = [Position(ROOT)] if not edges else list(self.path(edges[:-1]))
         if edges:
             positions.append(self._step(positions[-1], edges[-1]))
         self._paths[key] = positions
@@ -74,27 +83,26 @@ class _Space:
     def _step(self, pos: Position, edge: Edge) -> Position:
         if edge.is_temporal:
             return pos.shifted(edge.bound.window_size)
-        if edge.event == RECORD_END:
-            return Position(TOP)
-        if edge.event == RECORD_START:
-            return Position(BOTTOM)
+        if edge.event == END_OF_RECORD_KEY:
+            return Position(RECORD_END_ANCHOR)
+        if edge.event == START_OF_RECORD_KEY:
+            return Position(RECORD_START_ANCHOR)
         if edge.is_end_rooted:
             anchor = Anchor(edge.event, upper=pos, strict=not edge.bound.left_inclusive)
         else:
             anchor = Anchor(edge.event, lower=pos, strict=not edge.bound.right_inclusive)
-        anchors = self.analysis.anchors
-        if anchor not in anchors:
-            anchors.append(anchor)
-            landing = Position(len(anchors) - 1)
+        n_anchors = len(self.ordering.anchors)
+        landing = self.ordering.add(anchor)
+        if len(self.ordering.anchors) > n_anchors:
             if edge.is_end_rooted:
                 gap = Interval(landing, pos, False, not anchor.strict)
                 search = None  # a backward search's range is not bounded below by anything provable
             else:
                 gap = Interval(pos, landing, not anchor.strict, False)
-                search = Interval(pos, Position(TOP), not anchor.strict, True)
+                search = Interval(pos, Position(RECORD_END_ANCHOR), not anchor.strict, True)
             self.landings.append(_Landing(edge.event, landing, search))
             self.gaps.append(CountBound(edge.event, gap, 0, 0))
-        return Position(anchors.index(anchor))
+        return landing
 
     def region(self, edges: Iterable[Edge]) -> Interval:
         """The interval of a branch's last window."""
@@ -136,8 +144,8 @@ def _merge_same_region(branches: list[Branch]) -> list[Branch]:
         terminal = branch.terminal
         if not terminal.is_constrained or terminal.label is not None:
             continue
-        prefix = tuple((_bound_key(e.bound), e.constraints, e.label) for e in branch.edges[:-1])
-        groups.setdefault((prefix, _bound_key(terminal.bound)), []).append(i)
+        prefix = tuple(e.shape for e in branch.edges[:-1])
+        groups.setdefault((prefix, terminal.shape[0]), []).append(i)
     out = list(branches)
     dropped: set[int] = set()
     for members in groups.values():
@@ -153,27 +161,26 @@ def _merge_same_region(branches: list[Branch]) -> list[Branch]:
     return [b for i, b in enumerate(out) if i not in dropped]
 
 
-def simplify_branches(
+def remove_redundancy(
     branches: Iterable[Branch],
     implies: Callable[[str, str], bool],
     at_prediction_time: Iterable[str] = (),
-    task_cfg: TaskExtractorConfig | None = None,
 ) -> tuple[Branch, ...]:
     """Removes redundant criteria and branches (see the module docstring).
 
     Args:
         branches: The normalized branches (label branch included).
-        implies: ``implies(g, p)``: an occurrence of predicate ``g`` is also an occurrence of ``p``.
+        implies: ``implies(g, p)``: an occurrence of predicate ``g`` is also an occurrence of ``p`` (see
+            [`implication`][aces_relaxations.predicates.implication]).
         at_prediction_time: Predicates guaranteed to occur exactly at the prediction time.
-        task_cfg: The configuration, if available (only used to render positions in messages).
 
     Returns:
         The simplified branches, in the input order.
 
     Examples:
         >>> from aces.types import TemporalWindowBounds, ToEventWindowBounds
-        >>> from .future_only import _implies
-        >>> implies = _implies(in_hosp_mortality_cfg)
+        >>> from aces_relaxations.predicates import implication
+        >>> implies = implication(in_hosp_mortality_cfg)
         >>> gap = Edge("gap", TemporalWindowBounds(False, timedelta(days=1), True))
         >>> target = Edge("target", ToEventWindowBounds(False, "discharge_or_death", True), label="death")
         >>> label = Branch((gap, target))
@@ -185,7 +192,7 @@ def simplify_branches(
         >>> a = one("a", 5, (("admission", (None, 0)),))
         >>> b = one("b", 2, (("admission", (None, 0)),))
         >>> c = one("c", 2, (("death", (1, None)),))
-        >>> for br in simplify_branches([label, a, b, c], implies): print(br)
+        >>> for br in remove_redundancy([label, a, b, c], implies): print(br)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         a: start + 5 days (admission: (None, 0))
         b__c: start + 2 days (death: (1, None))
@@ -198,7 +205,7 @@ def simplify_branches(
         >>> stay = Edge("stay", ToEventWindowBounds(False, "discharge", True))
         >>> own_edge = Edge("stay_bounding_event", ToEventWindowBounds(False, "discharge", True), occurs)
         >>> own = Branch((own_edge,))
-        >>> for br in simplify_branches([label, own, Branch((stay, again))], implies): print(br)
+        >>> for br in remove_redundancy([label, own, Branch((stay, again))], implies): print(br)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         stay_bounding_event: start -> discharge (discharge: (1, None))
 
@@ -207,14 +214,14 @@ def simplify_branches(
 
         >>> bare = Branch((Edge("stay", ToEventWindowBounds(False, "discharge", True)),))
         >>> week = Branch((Edge("week", TemporalWindowBounds(False, timedelta(days=7), True)),))
-        >>> for br in simplify_branches([label, own, bare, week], implies): print(br)
+        >>> for br in remove_redundancy([label, own, bare, week], implies): print(br)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         stay_bounding_event: start -> discharge (discharge: (1, None))
 
         An unconstrained hop that nothing proves to land is kept, since ACES drops rows on which it does
         not:
 
-        >>> for br in simplify_branches([label, bare], implies): print(br)
+        >>> for br in remove_redundancy([label, bare], implies): print(br)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         stay: start -> discharge
 
@@ -222,25 +229,18 @@ def simplify_branches(
         the record's start being at the prediction time guarantees no occurrence of anything:
 
         >>> since = Edge("since_start", ToEventWindowBounds(True, "-_RECORD_START", True), occurs)
-        >>> for br in simplify_branches([label, Branch((since,))], implies, ["_RECORD_START"]): print(br)
+        >>> for br in remove_redundancy([label, Branch((since,))], implies, ["_RECORD_START"]): print(br)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         since_start: end <- _RECORD_START (discharge: (1, None))
     """
-
-    def extended(g: str, p: str) -> bool:
-        # Record boundaries are positions, not predicates.
-        if g.startswith("_RECORD_") or p.startswith("_RECORD_"):
-            return False
-        return p == "_ANY_EVENT" or implies(g, p)
-
-    space = _Space(Analysis(task_cfg, extended, anchors=[Anchor(None)]))
-    space.landings.extend(_Landing(p, Position(0)) for p in at_prediction_time)
+    space = _Space()
+    space.landings.extend(_Landing(p, Position(ROOT)) for p in at_prediction_time)
 
     current = _merge_same_region(list(branches))
     # Positions and facts for every branch (prefix positions are shared).
     for branch in current:
         space.path(branch.edges)
-    an = space.analysis
+    order = space.ordering
 
     def criteria() -> list[_Criterion]:
         out = []
@@ -258,9 +258,9 @@ def simplify_branches(
             (o.branch, o.predicate) != exclude
             and o.at_least is not None
             and o.at_least >= 1
-            and an.implies(o.predicate, landing.predicate)
-            and an.contains(landing.search, o.region)
-            and an.leq(o.region.hi, landing.position)
+            and implies(o.predicate, landing.predicate)
+            and order.contains(landing.search, o.region)
+            and order.leq(o.region.hi, landing.position)
             for o in alive
         )
 
@@ -269,7 +269,7 @@ def simplify_branches(
         return [
             ld
             for ld in space.landings
-            if (ld.search is None and ld.position == Position(0))
+            if (ld.search is None and ld.position == Position(ROOT))
             or (ld.search is not None and asserted(ld, alive, exclude))
         ]
 
@@ -283,12 +283,13 @@ def simplify_branches(
             any(
                 o.at_most is not None
                 and o.at_most <= hi
-                and an.implies(c.predicate, o.predicate)
-                and an.contains(o.region, c.region)
+                and (o.at_most == 0 or o.predicate == c.predicate)
+                and implies(c.predicate, o.predicate)
+                and order.contains(o.region, c.region)
                 for o in others
             )
             or any(
-                an.implies(c.predicate, g.predicate) and an.contains(g.interval, c.region) for g in space.gaps
+                implies(c.predicate, g.predicate) and order.contains(g.interval, c.region) for g in space.gaps
             )
         )
         lower_implied = (
@@ -297,16 +298,16 @@ def simplify_branches(
             and (
                 any(
                     o.at_least is not None
-                    and o.at_least >= lo
-                    and an.implies(o.predicate, c.predicate)
-                    and an.contains(c.region, o.region)
+                    and transferable_count(o.at_least, o.predicate, c.predicate) >= lo
+                    and implies(o.predicate, c.predicate)
+                    and order.contains(c.region, o.region)
                     for o in others
                 )
                 or (
                     lo == 1
                     and any(
-                        an.implies(ld.predicate, c.predicate)
-                        and an.contains(c.region, Interval.point(ld.position))
+                        implies(ld.predicate, c.predicate)
+                        and order.contains(c.region, Interval.point(ld.position))
                         for ld in landings
                     )
                 )
@@ -336,14 +337,15 @@ def simplify_branches(
             continue
         if terminal.is_temporal and not terminal.is_end_rooted:
             continue
-        if terminal.is_end_rooted or terminal.event == RECORD_END:
+        if terminal.is_end_rooted or terminal.event == END_OF_RECORD_KEY:
             kept_branches.append(branch)
             continue
         positions = space.path(branch.edges)
         anchor_pos, strict = positions[-2], not terminal.bound.right_inclusive
-        own = _Landing(terminal.event, positions[-1], Interval(anchor_pos, Position(TOP), not strict, True))
+        search = Interval(anchor_pos, Position(RECORD_END_ANCHOR), not strict, True)
+        own = _Landing(terminal.event, positions[-1], search)
         realizable = asserted(own, alive, ()) or any(
-            an.implies(ld.predicate, terminal.event) and an.leq(anchor_pos, ld.position, strict=strict)
+            implies(ld.predicate, terminal.event) and order.leq(anchor_pos, ld.position, strict=strict)
             for ld in landings
         )
         if not realizable:
