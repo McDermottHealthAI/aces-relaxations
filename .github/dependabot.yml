@@ -26,6 +26,29 @@ updates:
       - "github-actions"
     open-pull-requests-limit: 5
 
+  # The composite setup action. Dependabot's `github-actions` ecosystem only
+  # scans `.github/workflows` for the "/" directory, so the action pinned in
+  # `.github/actions/setup/action.yaml` needs its own entry to stay in step
+  # with the workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/.github/actions/setup"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    open-pull-requests-limit: 5
+
   # Python dependencies via uv (pyproject.toml + uv.lock).
   - package-ecosystem: "uv"
     directory: "/"
