@@ -1,7 +1,7 @@
 """Predicate expression trees over the plain predicates of an ACES task configuration.
 
 ACES predicates are either *plain* (a code, optionally with value bounds) or *derived* (``and(...)`` /
-``or(...)`` over other predicates, possibly nested). Several relaxations need to reason about which plain
+``or(...)`` over other predicates, possibly nested). Several analyses need to reason about which plain
 predicates a window criterion or label ultimately depends on; this module expands derived predicates into an
 explicit expression tree whose leaves are plain predicate names.
 """
@@ -167,7 +167,7 @@ def label_predicate_expr(task_cfg: TaskExtractorConfig) -> PredicateExpr:
     Examples:
         >>> print(label_predicate_expr(sample_ACES_cfg))
         death
-        >>> cfg = RelaxedTaskConfig(
+        >>> cfg = TaskExtractorConfig(
         ...     predicates=sample_ACES_cfg.predicates, trigger=sample_ACES_cfg.trigger,
         ...     windows={"w": WindowConfig("trigger", "start + 1d", True, True)},
         ... )

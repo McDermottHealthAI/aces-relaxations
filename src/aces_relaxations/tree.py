@@ -14,41 +14,6 @@ syntax used in ACES configs onto the nodes that actually exist in the tree.
 from typing import Literal, NamedTuple
 
 from aces.config import TaskExtractorConfig, WindowConfig
-from bigtree import Node
-
-
-class RelaxedTaskConfig(TaskExtractorConfig):
-    """An ACES task configuration whose window tree can be re-rooted.
-
-    Plain ACES configurations are always rooted at the ``trigger`` node. Relaxed configurations are typically
-    re-rooted at the prediction-time node (so that only the future of the prediction time is described) by
-    [`strip_to_relevant_windows`][aces_relaxations.relaxations.strip_to_relevant_windows]. This subclass
-    stores that alternate root and exposes it through the usual ``window_tree`` property.
-
-    Examples:
-        >>> cfg = RelaxedTaskConfig(
-        ...     predicates=sample_ACES_cfg.predicates,
-        ...     trigger=sample_ACES_cfg.trigger,
-        ...     windows=sample_ACES_cfg.windows,
-        ... )
-        >>> cfg.window_tree.node_name
-        'trigger'
-        >>> cfg.window_tree = cfg.window_nodes["input.end"]
-        >>> cfg.window_tree.node_name
-        'input.end'
-    """
-
-    @property
-    def window_tree(self) -> Node:
-        """The root node of the (possibly re-rooted) window tree."""
-        if not hasattr(self, "_root_node"):
-            return self.window_nodes["trigger"]
-        else:
-            return self.window_nodes[self._root_node]
-
-    @window_tree.setter
-    def window_tree(self, node: Node):
-        self._root_node = node.node_name
 
 
 class WindowNode(NamedTuple):
@@ -277,7 +242,7 @@ def prediction_time_node(task_cfg: TaskExtractorConfig) -> WindowNode:
         WindowNode(name='input', root='end')
         >>> prediction_time_node(readmission_cfg)
         WindowNode(name='trigger', root=None)
-        >>> cfg = RelaxedTaskConfig(
+        >>> cfg = TaskExtractorConfig(
         ...     predicates=sample_ACES_cfg.predicates,
         ...     trigger=sample_ACES_cfg.trigger,
         ...     windows={"w": WindowConfig("trigger", "start + 1d", True, True)},
@@ -309,7 +274,7 @@ def label_node(task_cfg: TaskExtractorConfig) -> WindowNode:
     Examples:
         >>> label_node(sample_ACES_cfg)
         WindowNode(name='target', root='end')
-        >>> cfg = RelaxedTaskConfig(
+        >>> cfg = TaskExtractorConfig(
         ...     predicates=sample_ACES_cfg.predicates,
         ...     trigger=sample_ACES_cfg.trigger,
         ...     windows={"w": WindowConfig("trigger", "start + 1d", True, True)},

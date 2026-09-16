@@ -1,19 +1,24 @@
-"""Relaxations and structural properties for ACES task configurations.
+"""Normalized form, structural properties, and count-constraint simplification for ACES task configurations.
 
-This package lets you take a future-only [ACES](https://eventstreamaces.readthedocs.io/) task configuration
-and (a) check that it is *guaranteeably future-only*, (b) prune it to the windows that matter after the
-prediction time, and (c) apply named *relaxations* that simplify its constraints and window structure so it
-can be expressed in reduced query languages (generative trajectory labeling, "ever / never within a region"
-queries, and so on).
+This package takes a future-only [ACES](https://eventstreamaces.readthedocs.io/) task configuration and
+(a) checks that it is *guaranteeably future-only*, (b) detects *degeneracies* (labels the configuration
+forces before any data is seen, and criteria no row can satisfy), (c) rewrites it into a label-preserving
+*normalized form* that separates the target chain from its conditions, and (d) optionally simplifies count
+criteria to the "ever" / "never" shapes that reduced query languages can express. Model-specific converters
+that consume the normalized form live in sibling repositories.
 
 Key entry points:
   - [`normalize`][aces_relaxations.normalization.normalize] -- the normalized form: the target chain separated
     from condition branches, label-preserving (checked against ACES in the tests).
-  - [`relax`][aces_relaxations.registry.relax] -- validate, prune, and apply relaxations by name.
   - [`is_future_only`][aces_relaxations.future_only.is_future_only] /
     [`validate_future_only`][aces_relaxations.future_only.validate_future_only] -- the structural property.
   - [`degeneracies`][aces_relaxations.degeneracy.degeneracies] -- structurally forced labels (always 1 / 0)
     and unsatisfiable criteria.
+  - [`simplify_constraints`][aces_relaxations.constraint_simplification.simplify_constraints] -- count
+    criteria to "ever", "never", or nothing.
+  - [`label_only`][aces_relaxations.reductions.label_only] /
+    [`last_link_target`][aces_relaxations.reductions.last_link_target] -- reductions of the normalized form
+    shared by the converters.
   - [`print_ACES`][aces_relaxations.printing.print_ACES] -- a tree pretty-printer for configurations.
 """
 
@@ -33,31 +38,14 @@ from .extraction import (
     with_index_events,
 )
 from .future_only import future_only_violations, is_future_only, validate_future_only
-from .independence import assume_independent_codes
 from .normalization import Branch, Edge, NormalizedTaskConfig, branches, normalize
 from .predicates import PredicateExpr, label_predicate_expr, leaf_predicates, predicate_expr
 from .printing import get_constraint_str, print_ACES
 from .reductions import TargetWindow, label_only, last_link_target
-from .registry import RELAXATIONS, relax
-from .relaxations import (
-    collapse_temporal_gap_windows,
-    remove_all_criteria,
-    remove_post_label_windows,
-    strip_to_relevant_windows,
-)
 from .simplification import simplify_branches
-from .tree import RelaxedTaskConfig, WindowNode, label_node, prediction_time_node, resolve_node
-from .vocabulary import (
-    MARGINAL_CODE,
-    matching_codes,
-    quantized_value_codes,
-    restrict_to_vocabulary,
-    vocabulary_matches,
-)
+from .tree import WindowNode, label_node, prediction_time_node, resolve_node
 
 __all__ = [
-    "MARGINAL_CODE",
-    "RELAXATIONS",
     "Branch",
     "ConstraintSimplificationRules",
     "ConstraintTarget",
@@ -65,13 +53,10 @@ __all__ = [
     "Finding",
     "NormalizedTaskConfig",
     "PredicateExpr",
-    "RelaxedTaskConfig",
     "TargetWindow",
     "WindowNode",
-    "assume_independent_codes",
     "branches",
     "classify_constraint",
-    "collapse_temporal_gap_windows",
     "degeneracies",
     "extract",
     "extract_at",
@@ -88,22 +73,14 @@ __all__ = [
     "label_predicate_expr",
     "last_link_target",
     "leaf_predicates",
-    "matching_codes",
     "normalize",
     "predicate_expr",
     "prediction_time_node",
     "print_ACES",
-    "quantized_value_codes",
-    "relax",
-    "remove_all_criteria",
-    "remove_post_label_windows",
     "require_bounding_events",
     "resolve_node",
-    "restrict_to_vocabulary",
     "simplify_branches",
     "simplify_constraints",
-    "strip_to_relevant_windows",
     "validate_future_only",
-    "vocabulary_matches",
     "with_index_events",
 ]

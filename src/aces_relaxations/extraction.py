@@ -1,9 +1,10 @@
 """Run ACES extraction in-process, including on normalized configurations anchored at given prediction times.
 
-These helpers exist mainly to *test* relaxations against ACES itself: a relaxation that claims to preserve
-labels can be checked by extracting labels with the original configuration and with the relaxed one on the
-same data. Configurations are deep-copied before querying, because ACES mutates the ``offset`` of the window
-tree's bounds in place on every query.
+These helpers exist mainly to *test* transformations against ACES itself: a transformation that claims to
+preserve labels (normalization) or to weaken them in a known way (constraint simplification) can be checked by
+extracting labels with the original configuration and with the transformed one on the same data.
+Configurations are deep-copied before querying, because ACES mutates the ``offset`` of the window tree's
+bounds in place on every query.
 
 A normalized configuration (see ``aces_relaxations.normalization``) is triggered by a synthetic index-event
 predicate. To anchor it at the prediction times of interest, that predicate is switched on in the *predicate
