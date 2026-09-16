@@ -11,10 +11,15 @@ authors = [
 description = "Relaxations and structural properties for ACES task configurations, to map future-only task definitions onto reduced query languages."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+keywords = ["ACES", "MEDS", "EHR", "task definitions", "foundation models", "zero-shot"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
     "bigtree>=0.31.2",

@@ -57,15 +57,15 @@ print_ACES(relaxed)
 
 ## Terminology
 
-| Term           | Description                                                                                                                                                                                                                                         |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ACES           | [ACES](https://eventstreamaces.readthedocs.io/en/latest/) is a domain specific language for describing task cohorts and a tool to automatically extract them from EHR datasets. It is the "source of truth" for task definitions in this work.      |
-| Task Config    | The (original / raw) ACES configuration file that describes the task cohort.                                                                                                                                                                        |
-| Input Window   | The window in the ACES config defining the "prediction time". This is indicated via the `index_timestamp` marker in the ACES config.                                                                                                                |
-| Target Window  | The window in the ACES config over which the label is extracted. This is indicated via the `label` marker in the ACES config.                                                                                                                       |
-| Future-only    | A config is *guaranteeably future-only* when both endpoints of its target window are reachable from the prediction time through edges that only move forward in time, so the label can only depend on data at or after the prediction time.         |
-| Relaxed Config | A config re-rooted at the prediction time and pruned to the windows between it and the target (plus any windows after the target). All relaxations operate on relaxed configs.                                                                      |
-| Relaxation     | A modification to the task config that removes constraints or simplifies the relationships between window endpoints. These are used to simplify or broaden the set of identified empirical labels when the task is posed to a reduced query system. |
+| Term           | Description                                                                                                                                                                                                                                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ACES           | [ACES](https://eventstreamaces.readthedocs.io/en/latest/) is a domain specific language for describing task cohorts and a tool to automatically extract them from EHR datasets. It is the "source of truth" for task definitions in this work.                                             |
+| Task Config    | The (original / raw) ACES configuration file that describes the task cohort.                                                                                                                                                                                                               |
+| Input Window   | The window in the ACES config defining the "prediction time". This is indicated via the `index_timestamp` marker in the ACES config.                                                                                                                                                       |
+| Target Window  | The window in the ACES config over which the label is extracted. This is indicated via the `label` marker in the ACES config.                                                                                                                                                              |
+| Future-only    | A config is *guaranteeably future-only* when both endpoints of its target window are reachable from the prediction time through edges that only move forward in time (or look back by a provably guaranteed amount), so the label can only depend on data at or after the prediction time. |
+| Relaxed Config | A config re-rooted at the prediction time and pruned to the windows between it and the target (plus any windows after the target). All relaxations operate on relaxed configs.                                                                                                             |
+| Relaxation     | A modification to the task config that removes constraints or simplifies the relationships between window endpoints. These are used to simplify or broaden the set of identified empirical labels when the task is posed to a reduced query system.                                        |
 
 ## The future-only property
 
@@ -123,6 +123,53 @@ The check is conservative: it never accepts a config that could look into the pa
 configs that are future-only only by arithmetic (e.g. `end - 1d` where the end is one day after the
 prediction time).
 
+## Degenerate configurations
+
+A configuration can fix its own outcome before any data is seen: a criterion may guarantee an occurrence of
+the label predicate inside the label window (every label is `True`), forbid one over a window enclosing it
+(every label is `False`), or contradict another criterion (no row ever satisfies them all). `degeneracies`
+lists such findings, and `is_always_positive` / `is_always_negative` / `is_unsatisfiable` summarize them:
+
+```pycon
+>>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
+>>> from aces_relaxations import degeneracies
+>>> predicates = {"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")}
+>>> cfg = TaskExtractorConfig(
+...     predicates=predicates,
+...     trigger=EventConfig("A"),
+...     windows={
+...         "week": WindowConfig("trigger", "start + 7d", False, True, has={"B": "(1, None)"}),
+...         "target": WindowConfig("trigger", "start + 10d", False, True, label="B"),
+...     },
+... )
+>>> for finding in degeneracies(cfg):
+...     print(finding)
+always_positive: 'week: B (1, None)' guarantees B within the label window (pos(trigger), pos(target.end)]
+>>> cfg = TaskExtractorConfig(
+...     predicates=predicates,
+...     trigger=EventConfig("A"),
+...     windows={
+...         "rest": WindowConfig("trigger", None, False, True, has={"B": "(None, 0)"}),
+...         "target": WindowConfig("trigger -> B", "start + 1d", False, True, label="A"),
+...     },
+... )
+>>> for finding in degeneracies(cfg):
+...     print(finding)
+unsatisfiable: 'rest: B (None, 0)' allows at most 0 but 'target.start is an occurrence of B' guarantees 1
+
+```
+
+The analysis works on the window tree symbolically. Every hop to the next (or prior) occurrence of a
+predicate guarantees one at its landing point and forbids any strictly between the search's start and that
+point; the trigger predicate occurs at the trigger; `(k, None)` criteria are lower bounds and `(None, k)`
+criteria upper bounds over their windows. Lower bounds propagate to enclosing intervals and upper bounds to
+enclosed ones, wherever the enclosure can be proven from the tree's structure (temporal offsets compare
+exactly; an event endpoint is only known to follow the position it was searched from). It is sound but
+incomplete: everything it reports is truly forced, checked by property tests against ACES on random data,
+but it can miss degeneracies that depend on orderings it cannot prove. Inclusivity matters: a label window
+`(trigger, next B]` is *not* always positive, because a `B` at the trigger is the next `B` and makes the
+window empty.
+
 ## Normalized form
 
 Relaxations change what a task means. Before changing anything, it helps to have a canonical way of writing
@@ -141,8 +188,23 @@ the *normalized form*, produced by `normalize`:
     leading to it, then the constrained window. The label window's branch carries no criteria at all, and
     unconstrained event-bounded leaf windows stay as branches because ACES drops rows whose event-bounded
     windows cannot be realized.
-4. Along each branch, runs of unconstrained, unlabeled, temporal windows collapse into one window.
-5. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
+4. Along each branch, runs of unconstrained, unlabeled windows whose composition is a single window
+    collapse into it: two temporal windows into one of the summed size, and a window followed by a hop to
+    the next `Q` into one hop to the next `Q` from the first window's start whenever `Q` is provably absent
+    wherever the longer search would additionally look (by a criterion on any window covering it, or by an
+    earlier hop's gap, e.g. `-> A_or_B` then `-> A`). A hop that lands where it starts (an inclusive search
+    for an event the position already is) drops out of the chain. Exactness at the endpoints is checked:
+    with ACES's usual `(start, next P]` window a `Q` exactly at the start is not forbidden, so that shape
+    only merges when the first window includes its start or excludes its end, or when a `Q` there would
+    have stopped the previous hop anyway.
+5. Redundant criteria and branches are removed (`aces_relaxations.simplification`): constrained windows
+    with the same prefix and bound merge into one; a criterion implied by another (a tighter bound on an
+    implying / implied predicate over a containing / contained window), by a hop's gap, or by an occurrence
+    guaranteed inside its window goes; a branch that asserts nothing (an unconstrained temporal window, or an
+    unconstrained hop whose landing a criterion guarantees) goes. A hop's landing counts as a guarantee only
+    when some *other* criterion explicitly asserts that the hop lands, so the "bounding event occurs"
+    criteria of step 3 stay: they are what makes realizability explicit for downstream converters.
+6. Branches sharing an unconstrained prefix share those windows, so the result is again a tree in which
     every root-to-leaf path chains `start` to the previous `end`, and criteria sit only on the last window.
 
 The result is a genuine ACES configuration, triggered by a synthetic `index_event` predicate that marks the
@@ -156,10 +218,10 @@ trigger; **Prediction Time**
 ├── (next discharge) hospitalization.end
 │   ├── (+1 day, 0:00:00) gap.end
 │   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-│   ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
-│   └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
+│   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
 ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
-└── (next discharge) hospitalization_criteria.end (no death)
+├── (next discharge) hospitalization_criteria.end (no death)
+└── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 >>> print(normalized.label_branch)
 hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
 >>> for branch in normalized.criteria_branches:
@@ -167,8 +229,7 @@ hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 
 post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
 hospitalization: start -> discharge (death: (None, 0))
 hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
-hospitalization: start -> discharge -> hospitalization_bounding_event: start -> discharge (discharge: (1,
-None))
+hospitalization_bounding_event: start -> discharge (discharge: (1, None))
 
 ```
 
@@ -206,10 +267,14 @@ ambiguity by stating the requirement as an ordinary criterion, and works on any 
     `P: (1, None)` itself;
 - otherwise it may not be: an exclusive bounding endpoint never counts it, and even an inclusive one does
     not when the window is zero-length with an exclusive other endpoint (`[t, t)` is empty), which happens
-    whenever the bounding event coincides with the other endpoint. Then a zero-length auxiliary window
-    anchored at the bounding event (`start: x.end`, `end: start -> P`, both endpoints inclusive) carries
-    the criterion. ACES resolves it to the bounding event itself, so it always holds when `x` is
-    realizable; under infinity semantics it fails exactly when `P` never occurs.
+    whenever the bounding event coincides with the other endpoint. Then an auxiliary window carries the
+    criterion, in whichever of two forms is exact. A forward bound with an inclusive end gets a *sibling*
+    repeating the same search from the same anchor, both endpoints inclusive: it resolves to the same
+    bounding event and counts it, and under infinity semantics it reads directly as an infinite window
+    containing no `P`, failing the criterion. Any other bound (a strict forward search, which skips a `P`
+    at its anchor, or a look-back, which ACES resolves strictly before an external anchor) gets a
+    zero-length *singleton* anchored at the bounding event itself, which ACES resolves to `[t, t]` there;
+    no sibling search can be exact for those.
 
 It never adds a criterion that is already implied, so it is idempotent, and it is a no-op for ACES, which
 a property test checks on arbitrary configurations. Both normalized forms apply it first.
@@ -221,8 +286,8 @@ trigger
 ├── (start of record) sufficient_history.start (at least 5 event(s))
 └── (+1 day, 0:00:00) input.end (no admission, discharge_or_death); **Prediction Time**
     └── (+1 day, 0:00:00) gap.end (no admission, discharge_or_death)
-        └── (next discharge_or_death) target.end; **Label: Presence of death**
-            └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+        ├── (next discharge_or_death) target.end; **Label: Presence of death**
+        └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
 
 ```
 
@@ -278,10 +343,10 @@ written as a start-rooted chain.
 >>> print_ACES(normalize(stay_cfg, allow_end_rooted=True))
 trigger; **Prediction Time**
 └── (+5 days, 0:00:00) wait.end
-    └── (next discharge) stay.end
-        ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
-        ├── (-1 day, 0:00:00) last_day.start (at least 1 lab)
-        └── (next discharge) stay_bounding_event.end (at least 1 discharge)
+    ├── (next discharge) stay.end
+    │   ├── (+30 days, 0:00:00) target.end; **Label: Presence of admission**
+    │   └── (-1 day, 0:00:00) last_day.start (at least 1 lab)
+    └── (next discharge) stay_bounding_event.end (at least 1 discharge)
 
 ```
 
@@ -1083,6 +1148,39 @@ input.end; **Prediction Time**
 
 ```
 
+## Model-agnostic reductions
+
+Beyond named relaxations, `aces_relaxations.reductions` holds the two structural moves every
+reduced-query-language converter shares, operating on the normalized form:
+
+- **`label_only(normalized)`** keeps the label branch alone, dropping every condition branch. This is
+    the *conditional independence* assumption: criteria (and event-bounded realizability requirements)
+    are taken not to change the label's distribution. It is provably violated when a dropped criterion
+    shares plain-predicate codes with the label (e.g. a gap window forbidding the label code, or an
+    inclusion criterion requiring it) — converters should surface the dropped branches so such tasks can
+    be recognized.
+- **`last_link_target(normalized)`** reduces the label branch to its last window, re-rooted at that
+    window's own start. This is the *TTE stationarity* assumption: the model's prediction at the
+    prediction time stands in for the prediction it would make at the label window's true start. The
+    label window keeps its own extent; the discarded intermediate windows' time is gone. The result is a
+    `TargetWindow`: a fixed-duration, event-bounded, or to-record-end window over the label predicate,
+    with a `note` recording any approximation made in re-rooting a look-back window.
+
+```pycon
+>>> from aces_relaxations import label_only, last_link_target
+>>> print(label_only(normalize(post_discharge_mortality_cfg)))
+hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
+>>> last_link_target(normalize(post_discharge_mortality_cfg)).describe()
+'death within 29.0 days of the window start (start exclusive, end inclusive)'
+>>> last_link_target(normalize(in_hosp_mortality_cfg)).describe()
+'death before the next or(discharge, death) after the window start (start exclusive, end inclusive)'
+
+```
+
+Model-specific interpretation of the `TargetWindow` (e.g. MOTOR's hazard compositions, marginal
+sentinels for out-of-vocabulary predicates, and the treatment of never-occurring bounding events)
+lives in the converter packages (`aces-to-motor` and siblings), typically in their decode step.
+
 ## Migrating from `MEDS_trajectory_evaluation`
 
 | `MEDS_trajectory_evaluation`                              | `aces_relaxations`                            |
@@ -1101,12 +1199,12 @@ labeling remain in `MEDS_trajectory_evaluation`.
 
 ## Roadmap
 
-Relaxations planned for reduced query languages used by other foundation models:
-
-- Mapping predicates over codes absent from a model vocabulary onto *nearby* in-vocabulary codes (e.g. via
-    a code hierarchy) rather than the marginal sentinel.
-- Mapping value-based predicates onto code-set predicates given quantized values joined with codes.
-- Simplifying complex multi-window queries into single-window approximations.
+- Ordering-dependent degeneracies and simplifications that the symbolic analysis cannot prove (it only
+    sees orderings that follow from the window tree's structure).
+- Value-based predicates beyond quantized value-bin codes, and `and` (co-occurrence) predicates, which
+    the implication machinery treats conservatively.
+- Mapping predicates over codes absent from a model vocabulary onto *nearby* in-vocabulary codes (a code
+    hierarchy lives with the model, so this belongs in the converters).
 
 ## Repository management
 

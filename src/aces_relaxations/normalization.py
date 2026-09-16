@@ -50,8 +50,9 @@ from aces.types import TemporalWindowBounds, ToEventWindowBounds
 from bigtree import Node
 
 from .bounding_events import require_bounding_events
-from .future_only import _initial_state, backward_edge_reason, validate_future_only
-from .guarantees import anchor_counts
+from .degeneracy import Analysis, Interval
+from .future_only import _implies, _initial_state, backward_edge_reason, validate_future_only
+from .guarantees import PathState, anchor_counts
 from .tree import prediction_time_node
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,12 @@ def _walk(
         if backward_edge_reason(node) is None:
             name = window_name if is_own else f"{window_name}_{side}_gap"
             edge = Edge(name, bound, constraints, node_label)
+            if _is_identity_hop(state, edge, counts):
+                # The search finds the event at the current position, so the chain does not move: the
+                # window is emitted (as a point or empty window) but contributes nothing to the chain.
+                state.add_criteria(raw_constraints, before, state.pos)
+                yield from emit(edge, is_leaf)
+                continue
             if edge.is_temporal:
                 state.advance_temporal(bound.window_size)
             else:
@@ -440,8 +447,102 @@ def _walk(
         stack.append(edge.unconstrained())
 
 
-def _collapse(branch: Branch) -> Branch:
-    """Merges runs of unconstrained, unlabeled, temporal windows.
+def _is_identity_hop(state: PathState, edge: Edge, counts: bool) -> bool:
+    """Whether a forward hop lands where it starts: an inclusive search for an event the position already is.
+
+    Examples:
+        >>> state = PathState(lambda g, p: g == p)
+        >>> state.advance_event("B")
+        >>> again = Edge("again", ToEventWindowBounds(False, "B", True))
+        >>> _is_identity_hop(state, again, counts=True), _is_identity_hop(state, again, counts=False)
+        (True, False)
+        >>> _is_identity_hop(state, Edge("c", ToEventWindowBounds(False, "C", True)), counts=True)
+        False
+    """
+    if edge.is_temporal or edge.is_end_rooted or edge.event == RECORD_END or not counts:
+        return False
+    return any(
+        g.start == g.end == state.pos
+        and not g.predicate.startswith("_RECORD_")
+        and (edge.event == "_ANY_EVENT" or state.implies(g.predicate, edge.event))
+        for g in state.guarantees
+    )
+
+
+def _edge_interval(analysis: Analysis, edge: Edge) -> Interval | None:
+    """The interval of an edge that is one of the analyzed configuration's forward windows (else ``None``)."""
+    node = analysis.task_cfg.window_nodes.get(f"{edge.name}.end")
+    if edge.is_end_rooted or node is None or _bound_key(node.endpoint_expr) != _bound_key(edge.bound):
+        return None
+    return analysis.window(edge.name)
+
+
+def _forbidden(analysis: Analysis, predicate: str, region: Interval) -> bool:
+    """Whether some criterion or hop provably forbids ``predicate`` over all of ``region``.
+
+    Examples:
+        >>> analysis = Analysis.of(in_hosp_mortality_cfg)
+        >>> gap = analysis.window("gap")
+        >>> _forbidden(analysis, "admission", gap), _forbidden(analysis, "death", gap)
+        (True, True)
+        >>> _forbidden(analysis, "death", analysis.window("target"))
+        False
+
+    Nothing occurs in an empty region:
+
+        >>> _forbidden(analysis, "death", Interval(gap.lo, gap.lo, False, False))
+        True
+    """
+    if analysis.is_empty(region):
+        return True
+    return any(
+        b.at_most == 0 and analysis.implies(predicate, b.predicate) and analysis.contains(b.interval, region)
+        for b in analysis.bounds
+    )
+
+
+def _mergeable_hop(analysis: Analysis, prev: Edge, region: Interval, edge: Edge) -> bool | None:
+    """Whether ``prev`` (spanning ``region``) then a hop to the next ``Q`` is one hop to the next ``Q``.
+
+    That holds when no ``Q`` can occur where the longer search looks but the shorter one does not, which
+    some criterion or hop of the configuration must forbid: strictly inside ``prev``'s window, at ``prev``'s
+    end when the hop is strict, and at ``prev``'s start when the merged search includes it (so either the
+    start is covered, or the merged search is made exclusive, which is only safe when ``prev``'s end is
+    certainly after its start or the original hop was strict).
+
+    Returns:
+        The inclusivity of the merged hop's found endpoint, or ``None`` if the windows cannot be merged.
+    """
+    q = edge.event
+    inclusive = edge.bound.right_inclusive
+    interior = Interval(region.lo, region.hi, False, False)
+    if not _forbidden(analysis, q, interior):
+        return None
+    if not inclusive and not _forbidden(analysis, q, Interval.point(region.hi)):
+        return None
+    # A ``Q`` at the start is harmless when the previous hop, searching inclusively for something ``Q``
+    # implies, would itself have stopped there, so that the original chain sees it too.
+    stops_there = (
+        not prev.is_temporal
+        and prev.bound.right_inclusive
+        and prev.event != RECORD_END
+        and analysis.implies(q, prev.event)
+    )
+    if stops_there or _forbidden(analysis, q, Interval.point(region.lo)):
+        return inclusive
+    if not inclusive or analysis.leq(region.lo, region.hi, strict=True):
+        return False
+    return None
+
+
+def _collapse(branch: Branch, analysis: Analysis | None = None) -> Branch:
+    """Merges runs of unconstrained, unlabeled windows whose composition is a single window.
+
+    Two consecutive temporal windows are one temporal window of the summed size. A window followed by a hop
+    to the next ``Q`` is one hop to the next ``Q`` from the first window's start when the configuration
+    provably forbids ``Q`` (or a predicate ``Q`` implies) where the longer search would additionally look:
+    by a criterion on any window covering it, or by an earlier hop's gap (see ``_mergeable_hop``). The
+    normalized form keeps every criterion on its own branch and every hop, so the merge preserves labels.
 
     Examples:
         >>> a = Edge("a", TemporalWindowBounds(True, timedelta(days=7), True))
@@ -458,14 +559,101 @@ def _collapse(branch: Branch) -> Branch:
         >>> d = Edge("d", TemporalWindowBounds(False, timedelta(days=3), True), label="death")
         >>> print(_collapse(Branch((a, d))))
         a: start + 7 days -> d: start + 3 days; label=death
+
+    Merging a hop needs the configuration's analysis, to know what is forbidden where. Here the stay (from
+    its start up to the next discharge) forbids admissions, so the next admission after the discharge is
+    the next admission after the stay's start:
+
+        >>> from aces.config import EventConfig
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={p: PlainPredicateConfig(p) for p in ("admission", "discharge", "death")},
+        ...     trigger=EventConfig("admission"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "stay": WindowConfig(
+        ...             "input.end", "start -> discharge", True, True, has={"admission": "(None, 0)"}
+        ...         ),
+        ...         "readmission": WindowConfig("stay.end", "start -> admission", False, True),
+        ...         "target": WindowConfig("readmission.end", "start + 30d", False, True, label="death"),
+        ...     },
+        ... )
+        >>> stay = Edge("stay", ToEventWindowBounds(True, "discharge", True))
+        >>> readmission = Edge("readmission", ToEventWindowBounds(False, "admission", True))
+        >>> target = Edge("target", TemporalWindowBounds(False, timedelta(days=30), True), label="death")
+        >>> print(_collapse(Branch((stay, readmission, target)), Analysis.of(cfg)))
+        stay__readmission: start -> admission -> target: start + 30 days; label=death
+
+    The merged hop keeps the original hop's inclusivity. Without the criterion nothing merges:
+
+        >>> cfg.windows["stay"].has = {}
+        >>> cfg = TaskExtractorConfig(predicates=cfg.predicates, trigger=cfg.trigger, windows=cfg.windows)
+        >>> print(_collapse(Branch((stay, readmission, target)), Analysis.of(cfg)))
+        stay: start -> discharge -> readmission: start -> admission -> target: start + 30 days; label=death
+
+    The criterion may sit on any window provably covering the first one, not only on that window itself.
+    Here a week-long wait is followed by a hop to the next admission, and a month-long window forbids
+    admissions:
+
+        >>> cfg.windows["stay"] = WindowConfig("input.end", "start + 7d", True, True)
+        >>> cfg.windows["cover"] = WindowConfig(
+        ...     "input.end", "start + 30d", True, True, has={"admission": "(None, 0)"}
+        ... )
+        >>> cfg = TaskExtractorConfig(predicates=cfg.predicates, trigger=cfg.trigger, windows=cfg.windows)
+        >>> week = Edge("stay", TemporalWindowBounds(True, timedelta(days=7), True))
+        >>> print(_collapse(Branch((week, readmission, target)), Analysis.of(cfg)))
+        stay__readmission: start -> admission -> target: start + 30 days; label=death
+
+    A hop to a predicate implied by the previous hop's event also merges, since that hop's gap forbids it:
+
+        >>> from aces.config import DerivedPredicateConfig
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={
+        ...         "A": PlainPredicateConfig("A"),
+        ...         "B": PlainPredicateConfig("B"),
+        ...         "C": PlainPredicateConfig("C"),
+        ...         "A_or_B": DerivedPredicateConfig("or(A, B)"),
+        ...     },
+        ...     trigger=EventConfig("C"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "either": WindowConfig("input.end", "start -> A_or_B", True, True),
+        ...         "a": WindowConfig("either.end", "start -> A", False, True),
+        ...         "target": WindowConfig("a.end", "start + 3d", False, True, label="C"),
+        ...     },
+        ... )
+        >>> either = Edge("either", ToEventWindowBounds(True, "A_or_B", True))
+        >>> a = Edge("a", ToEventWindowBounds(False, "A", True))
+        >>> t = Edge("target", TemporalWindowBounds(False, timedelta(days=3), True), label="C")
+        >>> print(_collapse(Branch((either, a, t)), Analysis.of(cfg)))
+        either__a: start -> A -> target: start + 3 days; label=C
+
+    Nor does a stay that excludes its start but includes its (event) end, ACES's usual ``(start, next
+    discharge]``: an admission exactly at the stay's start is not forbidden, and whether the original chain
+    lands on it depends on whether a discharge is there too (then the stay is zero-length and the hop finds
+    the admission), which a single hop from the start cannot reproduce either way:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={p: PlainPredicateConfig(p) for p in ("admission", "discharge", "death")},
+        ...     trigger=EventConfig("admission"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "stay": WindowConfig(
+        ...             "input.end", "start -> discharge", False, True, has={"admission": "(None, 0)"}
+        ...         ),
+        ...         "readmission": WindowConfig("stay.end", "start -> admission", False, True),
+        ...         "target": WindowConfig("readmission.end", "start + 30d", False, True, label="death"),
+        ...     },
+        ... )
+        >>> usual = Edge("stay", ToEventWindowBounds(False, "discharge", True))
+        >>> print(_collapse(Branch((usual, readmission, target)), Analysis.of(cfg)))
+        stay: start -> discharge -> readmission: start -> admission -> target: start + 30 days; label=death
     """
     merged: list[Edge] = []
+    regions: list[Interval | None] = []
     for edge in branch.edges:
         prev = merged[-1] if merged else None
-        mergeable = (
+        plain = (
             prev is not None
-            and prev.is_temporal
-            and edge.is_temporal
             and not prev.is_end_rooted
             and not edge.is_end_rooted
             and not prev.is_constrained
@@ -473,13 +661,28 @@ def _collapse(branch: Branch) -> Branch:
             and prev.label is None
             and edge.label is None
         )
-        if mergeable:
+        region = None if analysis is None else _edge_interval(analysis, edge)
+        if plain and prev.is_temporal and edge.is_temporal:
             total = prev.bound.window_size + edge.bound.window_size
             bound = TemporalWindowBounds(prev.bound.left_inclusive, total, edge.bound.right_inclusive)
             merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
-        else:
-            merged.append(edge)
+            regions[-1] = _span(regions[-1], region)
+            continue
+        if plain and not edge.is_temporal and edge.event != RECORD_END and regions[-1] is not None:
+            inclusive = _mergeable_hop(analysis, prev, regions[-1], edge)
+            if inclusive is not None:
+                bound = ToEventWindowBounds(prev.bound.left_inclusive, edge.event, inclusive)
+                merged[-1] = Edge(f"{prev.name}__{edge.name}", bound)
+                regions[-1] = _span(regions[-1], region)
+                continue
+        merged.append(edge)
+        regions.append(region)
     return Branch(tuple(merged))
+
+
+def _span(a: Interval | None, b: Interval | None) -> Interval | None:
+    """The interval from the first of two consecutive windows' start to the second's end."""
+    return None if a is None or b is None else Interval(a.lo, b.hi, a.lo_inclusive, b.hi_inclusive)
 
 
 @dataclass
@@ -550,15 +753,14 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
         >>> for b in branches(in_hosp_mortality_cfg): print(b)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
         gap: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
-        gap: start + 1 day -> target: start -> discharge_or_death; label=death -> target_bounding_event:
-        start -> discharge_or_death (discharge_or_death: (1, None))
+        gap: start + 1 day -> target_bounding_event: start -> discharge_or_death (discharge_or_death: (1,
+        None))
         >>> for b in branches(post_discharge_mortality_cfg): print(b)
         hospitalization: start -> discharge -> gap: start + 1 day -> target: start + 29 days; label=death
         post_input: start + 1 day (admission: (None, 0), discharge_or_death: (None, 0))
         hospitalization: start -> discharge (death: (None, 0))
         hospitalization: start -> discharge -> gap: start + 1 day (admission: (None, 0), death: (None, 0))
-        hospitalization: start -> discharge -> hospitalization_bounding_event: start -> discharge
-        (discharge: (1, None))
+        hospitalization_bounding_event: start -> discharge (discharge: (1, None))
         >>> for b in branches(readmission_cfg): print(b)
         gap: start + 1 day -> target: start + 29 days; label=admission
         gap: start + 1 day (admission: (None, 0), death: (None, 0))
@@ -573,14 +775,18 @@ def branches(task_cfg: TaskExtractorConfig, allow_end_rooted: bool = False) -> t
     """
     validate_future_only(task_cfg)
     task_cfg = require_bounding_events(task_cfg)
+    analysis = Analysis.of(task_cfg)
     root = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
 
     seen: dict[Branch, None] = {}
     for leaf in _future_leaves(task_cfg, root):
         for branch in _walk(task_cfg, root, leaf, allow_end_rooted):
-            seen[_collapse(branch)] = None
+            seen[_collapse(branch, analysis)] = None
 
-    ordered = list(seen)
+    from .simplification import simplify_branches  # circular at module level
+
+    at_pt = [g.predicate for g in _initial_state(task_cfg, root).guarantees]
+    ordered = list(simplify_branches(seen, _implies(task_cfg), at_pt, task_cfg))
     return tuple(sorted(ordered, key=lambda b: (not b.is_label_branch, ordered.index(b))))
 
 
@@ -615,8 +821,8 @@ def normalize(
         >>> print_ACES(normalized)
         trigger; **Prediction Time**
         ├── (+1 day, 0:00:00) gap.end
-        │   └── (next discharge_or_death) target.end; **Label: Presence of death**
-        │       └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
+        │   ├── (next discharge_or_death) target.end; **Label: Presence of death**
+        │   └── (next discharge_or_death) target_bounding_event.end (at least 1 discharge_or_death)
         └── (+1 day, 0:00:00) gap_criteria.end (no admission, discharge_or_death)
         >>> print(normalized.label_branch)
         gap: start + 1 day -> target: start -> discharge_or_death; label=death
@@ -632,10 +838,10 @@ def normalize(
         ├── (next discharge) hospitalization.end
         │   ├── (+1 day, 0:00:00) gap.end
         │   │   └── (+29 days, 0:00:00) target.end; **Label: Presence of death**
-        │   ├── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
-        │   └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
+        │   └── (+1 day, 0:00:00) gap_criteria.end (no admission, death)
         ├── (+1 day, 0:00:00) post_input.end (no admission, discharge_or_death)
-        └── (next discharge) hospitalization_criteria.end (no death)
+        ├── (next discharge) hospitalization_criteria.end (no death)
+        └── (next discharge) hospitalization_bounding_event.end (at least 1 discharge)
 
     Unconstrained temporal windows collapse; the label window and constrained windows never do:
 
@@ -655,9 +861,39 @@ def normalize(
         trigger; **Prediction Time**
         └── (+10 days, 0:00:00) gap1__gap2.end
             ├── (+5 days, 0:00:00) target.end; **Label: Presence of B**
-            ├── (next B) watch.end
-            │   └── (next B) watch_bounding_event.end (at least 1 B)
-            └── (next B) watch_criteria.end (no A)
+            ├── (next B) watch.end (no A)
+            └── (next B) watch_bounding_event.end (at least 1 B)
+
+    A hop that lands where it starts (an inclusive search for an event the position already is) drops out
+    of the chain, and a window followed by a hop to an event that is provably absent in between collapses
+    into one hop (see ``_collapse``). Here ``again`` is an identity hop, and ``either``'s gap forbids ``A``,
+    so the hop to the next ``A`` merges into it:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={
+        ...         "A": PlainPredicateConfig("A"),
+        ...         "B": PlainPredicateConfig("B"),
+        ...         "A_or_B": DerivedPredicateConfig("or(A, B)"),
+        ...     },
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "either": WindowConfig("input.end", "start -> A_or_B", True, True),
+        ...         "again": WindowConfig("either.end", "start -> A_or_B", False, True),
+        ...         "a": WindowConfig("again.end", "start -> A", False, True),
+        ...         "target": WindowConfig("a.end", "start + 3d", False, True, label="B"),
+        ...     },
+        ... )
+        >>> print_ACES(normalize(cfg))
+        trigger; **Prediction Time**
+        ├── (next A) either__a.end
+        │   └── (+3 days, 0:00:00) target.end; **Label: Presence of B**
+        ├── (next A_or_B) either.end
+        │   └── (next A) a_bounding_event.end (at least 1 A)
+        └── (next A_or_B) either_criteria.end (at least 1 A_or_B)
+
+    (``again``'s own "bounding event occurs" criterion was implied by ``either``'s landing, which
+    ``either_criteria`` asserts, and was removed; see ``aces_relaxations.simplification``.)
 
     Windows defined backward from a later endpoint are fine as long as they cannot reach before the
     prediction time; they are rewritten as forward chains. Here ``last_day`` is the final day of ``week``:
@@ -676,6 +912,32 @@ def normalize(
         ├── (+7 days, 0:00:00) week.end; **Label: Presence of B**
         └── (+6 days, 0:00:00) week__pre_last_day.end
             └── (+1 day, 0:00:00) last_day.end (at least 1 A)
+
+    Window names are kept where possible; a criteria copy of window ``w`` is named ``w_criteria``, and names
+    that are nonetheless taken get a numeric suffix:
+
+        >>> cfg = TaskExtractorConfig(
+        ...     predicates={c: PlainPredicateConfig(c) for c in "ABC"},
+        ...     trigger=EventConfig("A"),
+        ...     windows={
+        ...         "input": WindowConfig("trigger", "start + 1d", True, True, index_timestamp="end"),
+        ...         "w": WindowConfig("input.end", "start -> B", False, True, has={"C": "(None, 0)"}),
+        ...         "w_criteria": WindowConfig("w.end", "start + 3d", False, True, label="C"),
+        ...     },
+        ... )
+        >>> print_ACES(normalize(cfg))
+        trigger; **Prediction Time**
+        ├── (next B) w.end
+        │   └── (+3 days, 0:00:00) w_criteria.end; **Label: Presence of C**
+        ├── (next B) w_criteria_2.end (no C)
+        └── (next B) w_bounding_event.end (at least 1 B)
+
+    The synthetic index predicate must not collide with an existing one:
+
+        >>> normalize(in_hosp_mortality_cfg, index_predicate="death")
+        Traceback (most recent call last):
+            ...
+        ValueError: Predicate 'death' already exists; choose another index_predicate.
 
     Branches that start by moving backward from the prediction time lie before it and are discarded (with
     a warning); a window that could reach before the prediction time is rejected:
@@ -738,19 +1000,18 @@ def normalize(
         >>> print_ACES(universal)
         trigger; **Prediction Time**
         ├── (+5 days, 0:00:00) wait.end
-        │   └── (next discharge) stay.end
-        │       ├── (+30 days, 0:00:00) target.end; **Label: Presence of A**
-        │       ├── (-1 day, 0:00:00) last_day.start (at least 1 A)
-        │       ├── (prior admission) since_admission.start (no A; at least 1 admission)
-        │       └── (next discharge) stay_bounding_event.end (at least 1 discharge)
+        │   ├── (next discharge) stay.end
+        │   │   ├── (+30 days, 0:00:00) target.end; **Label: Presence of A**
+        │   │   ├── (-1 day, 0:00:00) last_day.start (at least 1 A)
+        │   │   └── (prior admission) since_admission.start (no A; at least 1 admission)
+        │   └── (next discharge) stay_bounding_event.end (at least 1 discharge)
         └── (+5 days, 0:00:00) wait_criteria.end (at least 1 admission)
         >>> for b in universal.criteria_branches: print(b)
         wait: start + 5 days (admission: (1, None))
         wait: start + 5 days -> stay: start -> discharge -> last_day: end - 1 day (A: (1, None))
         wait: start + 5 days -> stay: start -> discharge -> since_admission: end <- admission (A: (None,
         0), admission: (1, None))
-        wait: start + 5 days -> stay: start -> discharge -> stay_bounding_event: start -> discharge
-        (discharge: (1, None))
+        wait: start + 5 days -> stay_bounding_event: start -> discharge (discharge: (1, None))
         >>> universal.windows["last_day"].start, universal.windows["last_day"].end
         ('end - 1 day', 'stay.end')
 
