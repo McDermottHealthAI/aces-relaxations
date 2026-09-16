@@ -35,7 +35,8 @@ from typing import NamedTuple
 
 from aces.config import TaskExtractorConfig, WindowConfig
 
-RECORD_BOUNDARIES = ("_RECORD_START", "_RECORD_END")
+from .tree import RECORD_BOUNDARIES
+
 AUXILIARY_SUFFIX = "_bounding_event"
 
 
@@ -112,7 +113,7 @@ def require_bounding_events(task_cfg: TaskExtractorConfig) -> TaskExtractorConfi
     ``since_b`` get zero-length singletons anchored at their bounding events, and a window with both
     endpoints inclusive carries the criterion itself:
 
-        >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
+        >>> from aces.config import EventConfig, PlainPredicateConfig
         >>> cfg = TaskExtractorConfig(
         ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
         ...     trigger=EventConfig("A"),

@@ -19,9 +19,7 @@ from aces.config import (
     WindowConfig,
 )
 
-from aces_relaxations import print_ACES
-from aces_relaxations.extraction import extract
-from aces_relaxations.normalization import normalize
+from aces_relaxations import extract, normalize, print_ACES
 
 
 def _hospital_predicates() -> dict[str, PlainPredicateConfig | DerivedPredicateConfig]:
