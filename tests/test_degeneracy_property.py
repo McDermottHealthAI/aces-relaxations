@@ -8,44 +8,28 @@ Two directions:
   on random data must agree: every extracted label ``True`` / ``False``, or no row extracted at all.
 - **Arbitrary** configurations (no structural restrictions): whenever a detector fires, ACES's behavior on
   random data must agree. This is the soundness check; the detectors are allowed to miss degeneracies.
+
+Zero-length temporal windows are left out: ACES does not enforce criteria on them (and fails to extract a
+zero-length label window; ACES#212), so there it disagrees with the arithmetic rather than with the detectors.
 """
 
-import os
-
 import polars as pl
-from aces.config import (
-    DerivedPredicateConfig,
-    EventConfig,
-    PlainPredicateConfig,
-    TaskExtractorConfig,
-    WindowConfig,
-)
-from hypothesis import HealthCheck, assume, event, given, settings
+from aces.config import TaskExtractorConfig, WindowConfig
+from hypothesis import event, given
 from hypothesis import strategies as st
 
-from aces_relaxations.degeneracy import degeneracies
-from aces_relaxations.extraction import extract
+from aces_relaxations import degeneracies, extract
 
-from .test_normalize_property import CODES, PREDICATES, arbitrary_task_configs, meds_data, task_configs
-
-SETTINGS = settings(
-    max_examples=int(os.environ.get("HYPOTHESIS_MAX_EXAMPLES", "60")),
-    deadline=None,
-    suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much],
+from .strategies import (
+    PREDICATES,
+    SETTINGS,
+    arbitrary_task_configs,
+    config,
+    datasets,
+    implied_by,
+    meds_data,
+    task_configs,
 )
-
-
-def _predicates():
-    predicates = {c: PlainPredicateConfig(c) for c in CODES}
-    predicates["A_or_B"] = DerivedPredicateConfig("or(A, B)")
-    return predicates
-
-
-def _config(windows: dict[str, WindowConfig]) -> TaskExtractorConfig:
-    try:
-        return TaskExtractorConfig(predicates=_predicates(), trigger=EventConfig("A"), windows=windows)
-    except (ValueError, KeyError, TypeError):
-        assume(False)
 
 
 def _prefix(draw: st.DrawFn) -> tuple[dict[str, WindowConfig], str]:
@@ -100,7 +84,7 @@ def always_positive_configs(draw: st.DrawFn) -> TaskExtractorConfig:
             "trigger", f"start + {draw(st.integers(1, 10))}d", True, draw(st.booleans()), label=label
         )
     event(f"always_positive:{variant}")
-    return _config(windows)
+    return config(windows)
 
 
 @st.composite
@@ -130,7 +114,7 @@ def always_negative_configs(draw: st.DrawFn) -> TaskExtractorConfig:
         # The found endpoint is exclusive, so an occurrence at the start is skipped: the start must be too.
         windows["target"] = WindowConfig(ref, f"start -> {label}", False, False, label=label)
     event(f"always_negative:{variant}")
-    return _config(windows)
+    return config(windows)
 
 
 @st.composite
@@ -138,7 +122,7 @@ def unsatisfiable_configs(draw: st.DrawFn) -> TaskExtractorConfig:
     """Configurations whose criteria can never all hold, by construction."""
     windows, ref = _prefix(draw)
     label = draw(st.sampled_from(PREDICATES))
-    variant = draw(st.sampled_from(["forbidden_hop", "nested_counts", "before_next"]))
+    variant = draw(st.sampled_from(["forbidden_hop", "nested_counts", "disjoint_counts", "before_next"]))
     if variant == "forbidden_hop":
         # Some window hops to an event that is forbidden everywhere after the trigger.
         hop = draw(st.sampled_from(PREDICATES))
@@ -154,10 +138,16 @@ def unsatisfiable_configs(draw: st.DrawFn) -> TaskExtractorConfig:
         predicate = draw(st.sampled_from(PREDICATES))
         at_most = draw(st.integers(0, 2))
         at_least = at_most + draw(st.integers(1, 2))
+        # Only a single occurrence carries over to a predicate implied by the counted one.
+        outer_predicate = predicate if at_most > 0 else implied_by(draw, predicate)
         outer_start_inclusive = draw(st.booleans())
         inner_start_inclusive = outer_start_inclusive and draw(st.booleans())
         windows["outer"] = WindowConfig(
-            ref, f"start + {outer_days}d", outer_start_inclusive, True, has={predicate: f"(None, {at_most})"}
+            ref,
+            f"start + {outer_days}d",
+            outer_start_inclusive,
+            True,
+            has={outer_predicate: f"(None, {at_most})"},
         )
         windows["inner"] = WindowConfig(
             ref, f"start + {inner_days}d", inner_start_inclusive, True, has={predicate: f"({at_least}, None)"}
@@ -165,6 +155,16 @@ def unsatisfiable_configs(draw: st.DrawFn) -> TaskExtractorConfig:
         windows["target"] = WindowConfig(
             "outer.end", f"start + {draw(st.integers(1, 5))}d", False, True, label=label
         )
+    elif variant == "disjoint_counts":
+        # Two disjoint windows inside an outer one each require an occurrence, but the outer one allows one.
+        predicate = draw(st.sampled_from(PREDICATES))
+        k = draw(st.integers(1, 3))
+        windows["outer"] = WindowConfig(ref, f"start + {2 * k}d", False, True, has={predicate: "(None, 1)"})
+        windows["first"] = WindowConfig(ref, f"start + {k}d", False, True, has={predicate: "(1, None)"})
+        windows["second"] = WindowConfig(
+            "first.end", f"start + {k}d", False, True, has={predicate: "(1, None)"}
+        )
+        windows["target"] = WindowConfig("outer.end", "start + 1d", False, True, label=label)
     else:
         # An occurrence is required strictly before the next occurrence.
         predicate = draw(st.sampled_from(PREDICATES))
@@ -175,7 +175,7 @@ def unsatisfiable_configs(draw: st.DrawFn) -> TaskExtractorConfig:
             "gap.end", f"start + {draw(st.integers(1, 5))}d", False, True, label=label
         )
     event(f"unsatisfiable:{variant}")
-    return _config(windows)
+    return config(windows)
 
 
 def _kinds(task_cfg: TaskExtractorConfig) -> set[str]:
@@ -183,19 +183,20 @@ def _kinds(task_cfg: TaskExtractorConfig) -> set[str]:
 
 
 def _check_empirically(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame, kinds: set[str]) -> None:
-    """ACES's behavior on the data must agree with every detected kind."""
-    labeled = extract(task_cfg, MEDS_df)
-    event("rows extracted" if len(labeled) else "no rows extracted")
-    if "unsatisfiable" in kinds:
-        assert len(labeled) == 0, f"unsatisfiable, yet ACES extracted rows:\n{labeled}"
-    if "always_positive" in kinds:
-        assert labeled["boolean_value"].all(), (
-            f"always positive, yet ACES extracted a False label:\n{labeled}"
-        )
-    if "always_negative" in kinds:
-        assert not labeled["boolean_value"].any(), (
-            f"always negative, yet ACES extracted a True label:\n{labeled}"
-        )
+    """ACES's behavior on the drawn data and the fixed population must agree with every detected kind."""
+    for df in datasets(MEDS_df):
+        labeled = extract(task_cfg, df)
+        if "unsatisfiable" in kinds:
+            assert len(labeled) == 0, f"unsatisfiable, yet ACES extracted rows:\n{labeled}"
+        if "always_positive" in kinds:
+            assert labeled["boolean_value"].all(), (
+                f"always positive, yet ACES extracted a False label:\n{labeled}"
+            )
+        if "always_negative" in kinds:
+            assert not labeled["boolean_value"].any(), (
+                f"always negative, yet ACES extracted a True label:\n{labeled}"
+            )
+    event("population rows extracted" if len(labeled) else "no population rows extracted")
 
 
 @SETTINGS

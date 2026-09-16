@@ -17,21 +17,22 @@ from datetime import timedelta
 
 import numpy as np
 import polars as pl
-from aces.config import TaskExtractorConfig
+from aces.config import TaskExtractorConfig, WindowConfig
 from hypothesis import event, given
+from hypothesis import strategies as st
 
+from aces_relaxations import future_only_violations
 from aces_relaxations.extraction import extract_label_window_bounds
-from aces_relaxations.future_only import backward_edge_reason, future_only_violations
-from aces_relaxations.tree import prediction_time_node
-from tests.test_normalize_property import CODES, EPOCH, SETTINGS, arbitrary_task_configs
+from aces_relaxations.tree import backward_edge_reason, prediction_time_node
+
+from .strategies import CODES, EPOCH, MEDS_SCHEMA, PREDICATES, SETTINGS, arbitrary_task_configs, config
 
 LOOKS_BACK = "can move backward in time"
 
 
 def _derived_by_look_back(task_cfg: TaskExtractorConfig) -> bool:
     """Whether the prediction time is reached from the trigger through a backward edge."""
-    pt = task_cfg.window_nodes[prediction_time_node(task_cfg).node_name]
-    return any(backward_edge_reason(node) is not None for node in pt.node_path)
+    return any(backward_edge_reason(node) is not None for node in prediction_time_node(task_cfg).node_path)
 
 
 def sparse_population(seed: int, n_subjects: int = 100) -> pl.DataFrame:
@@ -51,7 +52,9 @@ def sparse_population(seed: int, n_subjects: int = 100) -> pl.DataFrame:
     for subject_id in range(1, n_subjects + 1):
         hours = np.sort(rng.integers(0, 24 * 30, size=rng.integers(8, 25)))
         for h in hours:
-            rows.append((subject_id, EPOCH + timedelta(hours=int(h)), CODES[rng.integers(len(CODES))]))
+            # A quarter of the events share their time with a second one, so conjunctions occur too.
+            for _ in range(1 + (rng.random() < 0.25)):
+                rows.append((subject_id, EPOCH + timedelta(hours=int(h)), CODES[rng.integers(len(CODES))]))
     return pl.DataFrame(
         {
             "subject_id": [r[0] for r in rows],
@@ -59,17 +62,27 @@ def sparse_population(seed: int, n_subjects: int = 100) -> pl.DataFrame:
             "code": [r[2] for r in rows],
             "numeric_value": [None] * len(rows),
         },
-        schema={
-            "subject_id": pl.Int64,
-            "time": pl.Datetime("us"),
-            "code": pl.String,
-            "numeric_value": pl.Float64,
-        },
+        schema=MEDS_SCHEMA,
     ).sort("subject_id", "time")
 
 
 POPULATIONS = [sparse_population(seed) for seed in range(4)]
 MIN_ROWS_FOR_A_VERDICT = 50
+
+LOOKS_BACK_EXPR = (
+    (pl.col("label_window_start") < pl.col("prediction_time"))
+    | (pl.col("label_window_end") < pl.col("prediction_time"))
+).alias("looks_back")
+
+
+def _realized_look_backs(task_cfg: TaskExtractorConfig) -> tuple[int, int] | None:
+    """How many label windows the populations realize, and how many reach before the prediction time."""
+    try:
+        bounds = pl.concat([extract_label_window_bounds(task_cfg, df) for df in POPULATIONS])
+    except Exception:
+        event("ACES failed on the configuration")
+        return None
+    return len(bounds), bounds.select(LOOKS_BACK_EXPR).sum().item() or 0
 
 
 @SETTINGS
@@ -77,23 +90,14 @@ MIN_ROWS_FOR_A_VERDICT = 50
 def test_future_only_verdict_matches_realized_windows(task_cfg: TaskExtractorConfig):
     """Guaranteed configs never look back on data; criteria-free reachable-but-unguaranteed ones do."""
     violations = future_only_violations(task_cfg)
-
-    try:
-        bounds = pl.concat([extract_label_window_bounds(task_cfg, df) for df in POPULATIONS])
-    except Exception:
-        event("ACES failed on the configuration")
+    if (realized := _realized_look_backs(task_cfg)) is None:
         return
-
-    looks_back = (
-        (pl.col("label_window_start") < pl.col("prediction_time"))
-        | (pl.col("label_window_end") < pl.col("prediction_time"))
-    ).alias("looks_back")
-    n_back = bounds.select(looks_back).sum().item() or 0
+    n_rows, n_back = realized
 
     if not violations:
         event("guaranteed future-only")
         assert n_back == 0, f"Guaranteed future-only, yet ACES realized {n_back} label window(s) in the past."
-    elif len(bounds) < MIN_ROWS_FOR_A_VERDICT:
+    elif n_rows < MIN_ROWS_FOR_A_VERDICT:
         event("too few rows realized; inconclusive")
     elif _derived_by_look_back(task_cfg):
         # The structural check ignores everything above the prediction time. When the prediction time is
@@ -109,8 +113,61 @@ def test_future_only_verdict_matches_realized_windows(task_cfg: TaskExtractorCon
     elif all(LOOKS_BACK in v for v in violations):
         event("reachable but can look back")
         assert n_back > 0, (
-            f"Structurally able to look back ({violations}), yet none of {len(bounds)} realized label "
-            "windows did."
+            f"Structurally able to look back ({violations}), yet none of {n_rows} realized label windows did."
         )
     else:
         event("label not reachable from the prediction time")
+
+
+@st.composite
+def unsafe_look_back_configs(draw: st.DrawFn) -> TaskExtractorConfig:
+    """A forward chain from the prediction time, then a label window looking back further than guaranteed.
+
+    The look-back is either a fixed offset longer than the temporal time on the chain (event hops guarantee
+    none), or a search for a prior event the chain never hopped to.
+    """
+    windows = {
+        "input": WindowConfig(
+            "trigger", f"start + {draw(st.integers(1, 3))}d", False, True, index_timestamp="end"
+        )
+    }
+    ref, guaranteed, hopped = "input.end", 0, set()
+    for i in range(draw(st.integers(0, 2))):
+        if draw(st.booleans()):
+            days = draw(st.integers(1, 3))
+            end, guaranteed = f"start + {days}d", guaranteed + days
+        else:
+            p = draw(st.sampled_from(CODES))
+            end = f"start -> {p}"
+            hopped.add(p)
+        windows[f"w{i}"] = WindowConfig(ref, end, draw(st.booleans()), draw(st.booleans()))
+        ref = f"w{i}.end"
+    unhopped = [p for p in CODES if p not in hopped]
+    if unhopped and draw(st.booleans()):
+        start = f"end <- {draw(st.sampled_from(unhopped))}"
+    else:
+        start = f"end - {guaranteed + draw(st.integers(1, 2))}d"
+    windows["target"] = WindowConfig(
+        start, ref, draw(st.booleans()), draw(st.booleans()), label=draw(st.sampled_from(PREDICATES))
+    )
+    return config(windows)
+
+
+@SETTINGS
+@given(unsafe_look_back_configs())
+def test_unguaranteed_look_backs_are_flagged_and_happen(task_cfg: TaskExtractorConfig):
+    """A look-back past what the chain guarantees is a violation, and does reach before the prediction time.
+
+    This is the direction the arbitrary-configuration test rarely reaches: most of its unguaranteed
+    configurations are inconclusive there.
+    """
+    violations = future_only_violations(task_cfg)
+    assert violations and all(LOOKS_BACK in v for v in violations), violations
+    if (realized := _realized_look_backs(task_cfg)) is None:
+        return
+    n_rows, n_back = realized
+    if n_rows < MIN_ROWS_FOR_A_VERDICT:
+        event("too few rows realized; inconclusive")
+        return
+    event("checked")
+    assert n_back > 0, f"None of {n_rows} realized label windows looked back ({violations})."
