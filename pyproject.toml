@@ -8,7 +8,7 @@ dynamic = ["version"] # Managed by setuptools-scm from git tags
 authors = [
   {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
 ]
-description = "Relaxations and structural properties for ACES task configurations, to map future-only task definitions onto reduced query languages."
+description = "The normalized form, structural properties, and count-constraint simplification of ACES task configurations, for posing future-only tasks to reduced query languages."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
