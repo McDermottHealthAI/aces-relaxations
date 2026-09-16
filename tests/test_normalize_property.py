@@ -48,9 +48,11 @@ def test_universal_normalization_preserves_labels(task_cfg: TaskExtractorConfig,
 @SETTINGS
 @given(task_configs(end_rooted=True), st.booleans())
 def test_normalization_is_structurally_normal(task_cfg: TaskExtractorConfig, allow_end_rooted: bool):
-    """Branches chain from the prediction time, criteria sit only on last windows, the label branch has none.
+    """The window tree is one stick per branch, ending in the label or in criteria, and nothing else.
 
-    The strict form never looks back; the universal form only in end-rooted windows.
+    Every branch chains from the prediction time, only its last window carries criteria or the label, and the
+    label branch carries no criteria. The strict form never looks back; the universal form only in end-rooted
+    windows.
     """
     try:
         normalized = normalize(task_cfg, allow_end_rooted=allow_end_rooted)
@@ -63,7 +65,20 @@ def test_normalization_is_structurally_normal(task_cfg: TaskExtractorConfig, all
     assert sum(b.is_label_branch for b in normalized.branches) == 1
     assert not normalized.label_branch.terminal.is_constrained
     for branch in normalized.branches:
-        assert all(not e.is_constrained for e in branch.edges[:-1]), str(branch)
+        assert all(not e.is_constrained and e.label is None for e in branch.edges[:-1]), str(branch)
+        assert (
+            branch.terminal.is_constrained
+            or branch.terminal.label is not None
+            or not branch.terminal.is_temporal
+        )
+    sticks = normalized.window_tree.children
+    assert len(sticks) == len(normalized.branches), [n.node_name for n in sticks]
+    for stick in sticks:
+        assert all(len(node.children) <= 1 for node in stick.descendants) and len(stick.children) <= 1
+        *inner, _leaf = (stick, *stick.descendants)
+        for node in inner:
+            window = normalized.windows[node.node_name.rsplit(".", 1)[0]]
+            assert not window.has and window.label is None, node.node_name
         if not allow_end_rooted:
             assert not any(e.is_end_rooted for e in branch.edges), str(branch)
     assert normalized.trigger.predicate == "index_event"
