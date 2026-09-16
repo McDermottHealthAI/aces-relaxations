@@ -1,18 +1,20 @@
-"""Predicate expression trees over the plain predicates of an ACES task configuration.
+"""Predicate expression trees over the plain predicates of an ACES task configuration, and implication.
 
 ACES predicates are either *plain* (a code, optionally with value bounds) or *derived* (``and(...)`` /
-``or(...)`` over other predicates, possibly nested). Several analyses need to reason about which plain
-predicates a window criterion or label ultimately depends on; this module expands derived predicates into an
-explicit expression tree whose leaves are plain predicate names.
+``or(...)`` over other predicates, possibly nested). Several analyses need to know which plain predicates a
+criterion or label ultimately depends on, and whether an occurrence of one predicate is necessarily an
+occurrence of another; this module expands derived predicates into explicit expression trees and decides that
+implication conservatively.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from aces.config import DerivedPredicateConfig, TaskExtractorConfig
+from aces.types import ANY_EVENT_COLUMN
 
-ANY_EVENT = "_ANY_EVENT"
+from .tree import RECORD_BOUNDARIES
 
 
 @dataclass(frozen=True)
@@ -62,15 +64,9 @@ class PredicateExpr:
     @property
     def leaves(self) -> set[str]:
         """The plain predicate names this expression depends on."""
-        return set(self.iter_leaves())
-
-    def iter_leaves(self) -> Iterator[str]:
-        """Yields the plain predicate names this expression depends on, in order, with repeats."""
         if self.op == "leaf":
-            yield self.name
-        else:
-            for child in self.children:
-                yield from child.iter_leaves()
+            return {self.name}
+        return set().union(*(child.leaves for child in self.children))
 
     @property
     def is_or_only(self) -> bool:
@@ -124,7 +120,7 @@ def predicate_expr(task_cfg: TaskExtractorConfig, name: str) -> PredicateExpr:
 
     Nested derived predicates are expanded recursively:
 
-        >>> from aces.config import DerivedPredicateConfig, EventConfig, PlainPredicateConfig, WindowConfig
+        >>> from aces.config import DerivedPredicateConfig, EventConfig, PlainPredicateConfig
         >>> cfg = TaskExtractorConfig(
         ...     predicates={
         ...         "a": PlainPredicateConfig("A"),
@@ -138,8 +134,8 @@ def predicate_expr(task_cfg: TaskExtractorConfig, name: str) -> PredicateExpr:
         >>> print(predicate_expr(cfg, "abc"))
         or(and(a, b), c)
     """
-    if name == ANY_EVENT:
-        return PredicateExpr.leaf(ANY_EVENT)
+    if name == ANY_EVENT_COLUMN:
+        return PredicateExpr.leaf(ANY_EVENT_COLUMN)
     if name not in task_cfg.predicates:
         raise KeyError(f"Predicate '{name}' is not defined.")
 
@@ -151,31 +147,64 @@ def predicate_expr(task_cfg: TaskExtractorConfig, name: str) -> PredicateExpr:
     return PredicateExpr.and_(*children) if pred.is_and else PredicateExpr.or_(*children)
 
 
-def leaf_predicates(task_cfg: TaskExtractorConfig, name: str) -> set[str]:
-    """The plain predicates a (possibly derived) predicate depends on.
+def implication(task_cfg: TaskExtractorConfig) -> Callable[[str, str], bool]:
+    """Returns ``implies(g, p)``: whether an occurrence of predicate ``g`` is necessarily one of ``p``.
+
+    The check is conservative (it may answer ``False`` for an implication that holds, never ``True`` for one
+    that does not): ``p`` must be a (nested) disjunction of plain predicates, and every disjunct of ``g`` (or
+    some conjunct of it) must be among them. Every occurrence is an event (``_ANY_EVENT``). The record
+    boundaries are positions rather than predicates, and imply and are implied by nothing.
+
+    This is implication of *occurrences*, not of counts: ACES counts every matching code of a plain predicate
+    at a timestamp, but a derived predicate (and ``_ANY_EVENT``) at most once, so two ``a`` codes at one time
+    are two occurrences of ``a`` and one of ``or(a, b)``. A count bound above 1 therefore only transfers
+    between identical predicates.
 
     Examples:
-        >>> sorted(leaf_predicates(sample_ACES_cfg, "discharge_or_death"))
-        ['death', 'icu_discharge']
-    """
-    return predicate_expr(task_cfg, name).leaves
-
-
-def label_predicate_expr(task_cfg: TaskExtractorConfig) -> PredicateExpr:
-    """The expression tree of the label predicate.
-
-    Examples:
-        >>> print(label_predicate_expr(sample_ACES_cfg))
-        death
+        >>> from aces.config import DerivedPredicateConfig, EventConfig, PlainPredicateConfig
         >>> cfg = TaskExtractorConfig(
-        ...     predicates=sample_ACES_cfg.predicates, trigger=sample_ACES_cfg.trigger,
+        ...     predicates={
+        ...         "a": PlainPredicateConfig("A"),
+        ...         "b": PlainPredicateConfig("B"),
+        ...         "ab": DerivedPredicateConfig("and(a, b)"),
+        ...         "a_or_b": DerivedPredicateConfig("or(a, b)"),
+        ...     },
+        ...     trigger=EventConfig("a"),
         ...     windows={"w": WindowConfig("trigger", "start + 1d", True, True)},
         ... )
-        >>> label_predicate_expr(cfg)
-        Traceback (most recent call last):
-            ...
-        ValueError: The task configuration has no label window.
+        >>> implies = implication(cfg)
+        >>> implies("a", "a"), implies("a", "a_or_b"), implies("a_or_b", "a"), implies("a", "_ANY_EVENT")
+        (True, True, False, True)
+
+    A co-occurrence implies each of its parts, but nothing implies a co-occurrence (except itself):
+
+        >>> implies("ab", "a"), implies("a", "ab"), implies("ab", "ab")
+        (True, False, True)
+        >>> implies("_RECORD_END", "_RECORD_END"), implies("a", "_RECORD_START")
+        (False, False)
+
+    A conjunction implies ``p`` only through a conjunct that does, so ``and(or(a, b), c)`` does not imply
+    ``a``:
+
+        >>> cfg.predicates["c"] = PlainPredicateConfig("C")
+        >>> cfg.predicates["a_or_b_and_c"] = DerivedPredicateConfig("and(a_or_b, c)")
+        >>> implies("a_or_b_and_c", "a"), implies("a_or_b_and_c", "a_or_b")
+        (False, True)
     """
-    if task_cfg.label_window is None:
-        raise ValueError("The task configuration has no label window.")
-    return predicate_expr(task_cfg, task_cfg.windows[task_cfg.label_window].label)
+
+    def occurs_within(expr: PredicateExpr, allowed: set[str]) -> bool:
+        if expr.op == "leaf":
+            return expr.name in allowed
+        if expr.op == "and":
+            return any(occurs_within(child, allowed) for child in expr.children)
+        return all(occurs_within(child, allowed) for child in expr.children)
+
+    def implies(g: str, p: str) -> bool:
+        if g in RECORD_BOUNDARIES or p in RECORD_BOUNDARIES:
+            return False
+        if g == p or p == ANY_EVENT_COLUMN:
+            return True
+        p_expr = predicate_expr(task_cfg, p)
+        return p_expr.is_or_only and occurs_within(predicate_expr(task_cfg, g), p_expr.leaves)
+
+    return implies

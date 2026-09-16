@@ -4,10 +4,16 @@ from collections import defaultdict
 from datetime import timedelta
 
 from aces.config import TaskExtractorConfig, WindowConfig
-from aces.types import TemporalWindowBounds, ToEventWindowBounds
+from aces.types import (
+    ANY_EVENT_COLUMN,
+    END_OF_RECORD_KEY,
+    START_OF_RECORD_KEY,
+    TemporalWindowBounds,
+    ToEventWindowBounds,
+)
 from bigtree import yield_tree
 
-from .tree import WindowNode, resolve_node
+from .tree import constraint_node_name, prediction_time_node
 
 
 def get_constraint_str(window_cfg: WindowConfig) -> str:
@@ -62,7 +68,7 @@ def get_constraint_str(window_cfg: WindowConfig) -> str:
     for k_raw, constraint in window_cfg.has.items():
         left, right = constraint
 
-        k = "event(s)" if k_raw == "_ANY_EVENT" else k_raw
+        k = "event(s)" if k_raw == ANY_EVENT_COLUMN else k_raw
 
         if left is None and right == 0:
             prefix = "no"
@@ -84,9 +90,11 @@ def get_constraint_str(window_cfg: WindowConfig) -> str:
 
 
 def print_ACES(task_cfg: TaskExtractorConfig, **kwargs):
-    """A pretty printer for ACES task configurations.
+    """Prints the window tree of an ACES task configuration, annotated with bounds, criteria, and label.
 
-    This is purely for development / debugging purposes.
+    Each line is one node of the tree: how it is reached from its parent (a temporal offset, or the next /
+    prior occurrence of a predicate), the window endpoint it realizes, the criteria of the window it closes,
+    and whether it is the prediction time or closes the label window.
 
     Args:
         task_cfg: The task configuration to print.
@@ -166,33 +174,20 @@ def print_ACES(task_cfg: TaskExtractorConfig, **kwargs):
             ...
         ValueError: Unexpected type <class 'str'> for endpoint expr: bogus.
     """
-    index_ts_window_name = getattr(task_cfg, "index_timestamp_window", None)
-
-    if index_ts_window_name:
-        index_ts_window = task_cfg.windows[index_ts_window_name]
-        index_ts_node = resolve_node(
-            task_cfg, root_node=WindowNode(index_ts_window_name, index_ts_window.index_timestamp)
-        )
-    else:
-        index_ts_node = None
+    index_ts_node = prediction_time_node(task_cfg) if task_cfg.index_timestamp_window else None
 
     for branch, stem, node in yield_tree(task_cfg.window_tree):
-        window_name = node.node_name.split(".")[0]
+        index_ts_str = "; **Prediction Time**" if node is index_ts_node else ""
 
-        if index_ts_node and (node.node_name == index_ts_node.node_name):
-            index_ts_str = "; **Prediction Time**"
-        else:
-            index_ts_str = ""
-
-        if window_name == "trigger":
+        if node is task_cfg.window_tree:
             print(f"{branch}{stem}{node.node_name}{index_ts_str}", **kwargs)
             continue
 
         match getattr(node, "endpoint_expr", None):
             case ToEventWindowBounds() as event_bound:
-                if event_bound.end_event == "-_RECORD_START":
+                if event_bound.end_event == f"-{START_OF_RECORD_KEY}":
                     event_str = "start of record"
-                elif event_bound.end_event == "_RECORD_END":
+                elif event_bound.end_event == END_OF_RECORD_KEY:
                     event_str = "end of record"
                 elif event_bound.end_event.startswith("-"):
                     event_str = f"prior {event_bound.end_event[1:]}"
@@ -209,22 +204,17 @@ def print_ACES(task_cfg: TaskExtractorConfig, **kwargs):
                     raise NotImplementedError("Offset not supported.")
                 else:
                     bound = f"({sign}{time_bound.window_size}) "
-            case None:
-                bound = ""
             case _ as other:
                 raise ValueError(f"Unexpected type {type(other)} for endpoint expr: {other}.")
 
+        window_name = node.node_name.rsplit(".", 1)[0]
         window_cfg = task_cfg.windows[window_name]
 
-        side = node.node_name.split(".")[1]
-
-        is_end_node = side != window_cfg.root_node
-
-        if not is_end_node:
+        if node.node_name != constraint_node_name(window_name, window_cfg):
             print(f"{branch}{stem}{bound}{node.node_name}{index_ts_str}", **kwargs)
             continue
 
         c_str = get_constraint_str(window_cfg)
-        constraint_str = f" ({get_constraint_str(window_cfg)})" if c_str else ""
+        constraint_str = f" ({c_str})" if c_str else ""
         label_str = f"; **Label: Presence of {window_cfg.label}**" if window_cfg.label else ""
         print(f"{branch}{stem}{bound}{node.node_name}{constraint_str}{label_str}{index_ts_str}", **kwargs)

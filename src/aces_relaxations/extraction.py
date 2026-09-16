@@ -1,10 +1,10 @@
-"""Run ACES extraction in-process, including on normalized configurations anchored at given prediction times.
+"""Run ACES extraction in memory, including on normalized configurations anchored at given prediction times.
 
-These helpers exist mainly to *test* transformations against ACES itself: a transformation that claims to
-preserve labels (normalization) or to weaken them in a known way (constraint simplification) can be checked by
-extracting labels with the original configuration and with the transformed one on the same data.
+These helpers exist mainly to *check* transformations against ACES itself: a transformation that claims to
+preserve labels (normalization) or to change them in a known direction (constraint simplification) can be
+checked by extracting labels with the original configuration and with the transformed one on the same data.
 Configurations are deep-copied before querying, because ACES mutates the ``offset`` of the window tree's
-bounds in place on every query.
+bounds in place on every query ([ACES#211](https://github.com/justin13601/ACES/issues/211)).
 
 A normalized configuration (see ``aces_relaxations.normalization``) is triggered by a synthetic index-event
 predicate. To anchor it at the prediction times of interest, that predicate is switched on in the *predicate
@@ -16,22 +16,21 @@ import copy
 import logging
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime
 
 import polars as pl
 from aces.config import TaskExtractorConfig
 from aces.predicates import get_predicates_df
 from aces.query import query
+from aces.types import ANY_EVENT_COLUMN
+from bigtree import Node
 from omegaconf import DictConfig
 
-from .future_only import backward_edge_reason
 from .normalization import INDEX_PREDICATE
-from .tree import WindowNode, prediction_time_node, resolve_node
+from .tree import backward_edge_reason, endpoint_node, prediction_time_node
 
 SUBJECT_ID = "subject_id"
 PREDICTION_TIME = "prediction_time"
 BOOLEAN_VALUE = "boolean_value"
-ANY_EVENT = "_ANY_EVENT"
 
 
 @contextmanager
@@ -74,25 +73,24 @@ def get_predicates(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.D
         return get_predicates_df(copy.deepcopy(task_cfg), DictConfig({"path": fp.name, "standard": "meds"}))
 
 
-def _node_time(task_cfg: TaskExtractorConfig, ref: WindowNode) -> pl.Expr:
-    """The realized timestamp of a (resolved) window-endpoint node in an ACES result.
+def _node_time(node: Node) -> pl.Expr:
+    """The realized timestamp of a window-tree node in an ACES result.
 
     A node's summary holds the timestamps of both ends of the edge into it, named by traversal direction
     rather than by time, so the node itself is the later one for a forward edge and the earlier one for a
-    backward edge. (ACES's own ``index_timestamp`` column uses the names literally, which for a window defined
-    backward from its end reports the wrong endpoint; the helpers here therefore take the prediction time from
-    the tree instead.)
+    backward edge. (ACES's own ``index_timestamp`` column uses the names literally (ACES#196), which for a
+    window defined backward from its end reports the wrong endpoint; the helpers here therefore take the
+    prediction time from the tree instead.)
     """
-    if ref.root is None:
+    if node.is_root:
         return pl.col("trigger")
-    summary = pl.col(f"{ref.node_name}_summary").struct
+    summary = pl.col(f"{node.node_name}_summary").struct
     ends = [summary.field("timestamp_at_start"), summary.field("timestamp_at_end")]
-    forward = backward_edge_reason(task_cfg.window_nodes[ref.node_name]) is None
-    return pl.max_horizontal(ends) if forward else pl.min_horizontal(ends)
+    return pl.max_horizontal(ends) if backward_edge_reason(node) is None else pl.min_horizontal(ends)
 
 
 def _prediction_time(task_cfg: TaskExtractorConfig) -> pl.Expr:
-    return _node_time(task_cfg, prediction_time_node(task_cfg)).cast(pl.Datetime("us")).alias(PREDICTION_TIME)
+    return _node_time(prediction_time_node(task_cfg)).cast(pl.Datetime("us")).alias(PREDICTION_TIME)
 
 
 def _tidy(task_cfg: TaskExtractorConfig, result: pl.DataFrame) -> pl.DataFrame:
@@ -199,9 +197,12 @@ def with_index_events(
     filled[index_predicate] = (
         pl.when(pl.col("__anchor") == 1).then(1).otherwise(0).cast(predicates_df.schema[index_predicate])
     )
-    if ANY_EVENT in value_cols:
-        filled[ANY_EVENT] = (
-            pl.when(is_new).then(0).otherwise(pl.col(ANY_EVENT)).cast(predicates_df.schema[ANY_EVENT])
+    if ANY_EVENT_COLUMN in value_cols:
+        filled[ANY_EVENT_COLUMN] = (
+            pl.when(is_new)
+            .then(0)
+            .otherwise(pl.col(ANY_EVENT_COLUMN))
+            .cast(predicates_df.schema[ANY_EVENT_COLUMN])
         )
 
     return (
@@ -231,7 +232,6 @@ def extract_at(
         absent.
 
     Examples:
-        >>> from aces_relaxations.normalization import normalize
         >>> original = extract(sample_ACES_cfg, sample_MEDS_df)
         >>> extract_at(normalize(sample_ACES_cfg), sample_MEDS_df, original).equals(original)
         True
@@ -239,16 +239,6 @@ def extract_at(
     with _quiet():
         predicates_df = with_index_events(get_predicates(task_cfg, MEDS_df), index_df, index_predicate)
         return _tidy(task_cfg, query(copy.deepcopy(task_cfg), predicates_df))
-
-
-def prediction_times(result: pl.DataFrame) -> list[tuple[int, datetime]]:
-    """The ``(subject_id, prediction_time)`` pairs of an extraction result, for quick comparisons.
-
-    Examples:
-        >>> prediction_times(extract(sample_ACES_cfg, sample_MEDS_df))
-        [(1, datetime.datetime(2020, 1, 2, 0, 0)), (2, datetime.datetime(2020, 1, 2, 0, 0))]
-    """
-    return list(result.select(SUBJECT_ID, PREDICTION_TIME).iter_rows())
 
 
 def extract_label_window_bounds(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.DataFrame:
@@ -284,7 +274,7 @@ def extract_label_window_bounds(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataF
 
     A label window that looks back from the next ``B`` event can start before the prediction time:
 
-        >>> from aces.config import EventConfig, PlainPredicateConfig, WindowConfig
+        >>> from aces.config import EventConfig, PlainPredicateConfig
         >>> cfg = TaskExtractorConfig(
         ...     predicates={"A": PlainPredicateConfig("A"), "B": PlainPredicateConfig("B")},
         ...     trigger=EventConfig("A"),
@@ -322,8 +312,8 @@ def extract_label_window_bounds(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataF
         return pl.DataFrame(schema=schema)
 
     def realized(side: str) -> pl.Expr:
-        ref = resolve_node(task_cfg, root_node=WindowNode(task_cfg.label_window, side))
-        return _node_time(task_cfg, ref).cast(pl.Datetime("us")).alias(f"label_window_{side}")
+        node = endpoint_node(task_cfg, task_cfg.label_window, side)
+        return _node_time(node).cast(pl.Datetime("us")).alias(f"label_window_{side}")
 
     return (
         result.select(
