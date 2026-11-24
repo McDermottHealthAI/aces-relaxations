@@ -68,7 +68,9 @@ def get_predicates(task_cfg: TaskExtractorConfig, MEDS_df: pl.DataFrame) -> pl.D
         │ 1          ┆ 2020-01-05 00:00:00 ┆ 0             ┆ 1             ┆ 0     ┆ 1                  │
         └────────────┴─────────────────────┴───────────────┴───────────────┴───────┴────────────────────┘
     """
-    with tempfile.NamedTemporaryFile(suffix=".parquet") as fp, _quiet():
+    # delete_on_close=False: the file is reopened by name while still open, which Windows forbids for a file
+    # opened with delete-on-close (WinError 32). It is still deleted when the context exits.
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete_on_close=False) as fp, _quiet():
         MEDS_df.write_parquet(fp.name, use_pyarrow=True)
         return get_predicates_df(copy.deepcopy(task_cfg), DictConfig({"path": fp.name, "standard": "meds"}))
 
